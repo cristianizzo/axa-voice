@@ -3,8 +3,8 @@
 Talk to Claude out loud, and interrupt it like you would a person.
 
 A voice front-end for Claude that runs on your machine: you speak, it answers in about a
-second and a half, and you can cut it off mid-sentence. It runs on open speakers — no
-headphones required — and it never reads code out loud.
+second, and you can cut it off mid-sentence. It runs on open speakers — no headphones
+required — and it never reads code out loud.
 
 > **Status:** design approved and revised against a working throwaway prototype
 > (`proto/talk.mjs`). Real implementation not started.
@@ -23,7 +23,7 @@ axa-voice targets exactly those three:
 
 | | Siri | axa-voice |
 |---|---|---|
-| Time to first sound | ~2s | ~1.5s (measured, not estimated) |
+| Time to first sound | ~2s | ~1.3s (measured, not estimated) |
 | Interrupt mid-answer | no | yes, silent within 50ms |
 | Knows where it got cut off | — | yes, it resumes from what you actually heard |
 | Reads code aloud | — | never; code stays on screen |

@@ -24,8 +24,7 @@ speak instead of typing, hear the answer, interrupt mid-sentence and be understo
 The target is not "text-to-speech on top of Claude". The target is the quality gap
 between Siri and a person, which is produced by three things and not by voice timbre:
 
-1. **Time to first sound** under ~1.5 s (Siri: ~2 s). See §4 — the original ~1 s target
-   was an estimate; 1.5 s is what the hardware and the model actually deliver.
+1. **Time to first sound** under ~1.3 s (Siri: ~2 s), measured end to end (§4).
 2. **Barge-in** — interrupting works, and the agent knows where it was cut off.
 3. **Spoken-appropriate content** — it says the meaning, not the code.
 
@@ -194,19 +193,41 @@ is a config change plus one new class.
 
 Time from the user falling silent to the first sound leaving the speakers.
 
-Figures below are **measured on the target machine** with the M0 prototype
-(`proto/talk.mjs`), not estimated. An earlier draft of this spec assumed 450 ms for
-Claude's first token; the real figure is roughly three times that, so the honest target
-is ~1.5 s rather than 1 s.
+Figures below are **measured on the target machine**, not estimated. The scripts that
+produced them live in `proto/` and are the instruments, not the architecture.
 
 | Stage | Budget | Basis |
 |---|---|---|
 | Transcription | 0 ms | Runs during speech. Measured 126–215 ms when run after the fact |
 | Turn end detection | 250 ms | §5, not yet measured |
-| Claude first token | 1300 ms | **Measured**, warm persistent session, no MCP |
+| Claude first token | 800 ms | **Measured**, median of 8 warm turns (`proto/check-ttft.mjs`) |
 | First speakable sentence | 100 ms | SpeechFilter emits on sentence boundary |
 | TTS first audio chunk | 150 ms | **Measured**, Cartesia WebSocket, median of 9 runs |
-| **Total** | **~1500 ms** | Enforced by automated test, §10 (Testing) |
+| **Total** | **~1300 ms** | Enforced by automated test, §10 (Testing) |
+
+### Measure turn N, never turn 1
+
+The first attempt at the first-token number produced **7040 ms**, and it was wrong in a
+way worth recording, because the automated latency test can make the identical mistake.
+
+It measured one turn in a fresh session. That turn pays for process spawn, config load
+and system-prompt processing — costs the user pays **once at launch**, not on every
+sentence they speak. Measured across four turns in one live session, first token settles
+at **672–999 ms** (median ~750), and the spread between turn 1 and turn 4 within a
+session is itself visible: turn 1 runs ~100 ms slower than the ones after it.
+
+So the latency test must warm the session, discard the first turn, and assert on the
+steady state. A test written the obvious way would have reported a 7 s system and sent
+someone off to optimise something that was never slow.
+
+Two consequences for the design:
+
+- `startup()` pre-warms the subprocess in **~900 ms**. That must happen while the app is
+  launching, before the user can speak, or it lands on the first turn.
+- An earlier draft of this spec guessed 450 ms for first token. The prototype's raw CLI
+  path measured 1300 ms. The SDK path measures ~800 ms. The gap between the last two is
+  not yet explained — pre-warming is the likely cause but it was not isolated — so 800 ms
+  is recorded as observed, not as understood.
 
 The TTS figure is a median because the spread is wide: 82–378 ms across nine runs
 (`proto/check-cartesia-ws.mjs`). Crucially, the spread does **not** track the model —
@@ -442,7 +463,9 @@ records to a buffer. Everything between is ordinary testable code.
 
 Three tests carry most of the value:
 
-1. **Latency** — feed a WAV, measure to first output frame, assert < 1500 ms (§4).
+1. **Latency** — feed a WAV, measure to first output frame, assert < 1300 ms (§4).
+   Warm the session and **discard the first turn**; asserting on turn 1 measures startup
+   cost and reports ~7 s (§4).
 2. **Barge-in** — start playback, inject speech at t=500 ms, assert output silent within
    50 ms and that `notifyInterruption` received the correct heard-prefix.
 3. **Director** — the state machine alone against fakes for all seven other components.
