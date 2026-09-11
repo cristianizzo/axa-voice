@@ -88,11 +88,38 @@ Eight components. Seven are deliberately stupid; one (the Director) holds all th
 
 ### Audio formats
 
-Fixed across all components, no negotiation:
+An earlier draft specified 16 kHz capture and 24 kHz playback. **That combination cannot
+be built**, and the reason shapes the architecture — see "One device, not two" below.
+VoiceProcessingIO requires both client scopes to run at the *same* sample rate;
+initialization fails with `-10875` on every off-diagonal pair, and the constraint holds
+even when one direction is disabled.
 
-- **Capture:** 16 kHz, mono, PCM16, 20 ms frames (320 samples).
-- **Playback:** 24 kHz, mono, PCM16. `Voice` implementations resample to this.
+So:
+
+- **The audio unit runs at 24 kHz, mono, PCM16, on both scopes.** TTS audio reaches the
+  speaker with zero resampling.
+- **Capture is resampled 24 k → 16 k inside the Swift helper**, on its writer thread,
+  never on the render thread. A clean 2:3 ratio. Not in Node: a CPU-bound resample loop
+  on the event loop that also feeds the audio device is how you get dropouts.
+- Everything above the helper still sees 16 kHz, mono, PCM16, 20 ms frames (320 samples).
 - `AudioFrame = Int16Array`.
+
+PCM16 is accepted by the unit — Float32 is not required. But note that
+`AudioUnitSetProperty` **returns `noErr` for formats the unit will not accept**; the
+failure surfaces later at `AudioUnitInitialize`. Check the initializer's return, not the
+setters'.
+
+### One device, not two
+
+`AudioInput` and `AudioOutput` are two interfaces over **one object**, backed by one
+`AUVoiceProcessor` instance: bus 1 is the microphone, bus 0 is the speaker. They are
+separate interfaces because the Director should not care, and because tests fake them
+independently. They are **not** separate implementations and must not be built as
+separate workstreams (§11).
+
+This is forced, not chosen. AEC works by using the playback signal as its reference, so
+the playback path has to run through the same unit as capture; and the shared-sample-rate
+constraint above means even a disabled direction still has to be configured.
 
 ### Component contracts
 
@@ -110,13 +137,15 @@ interface AudioInput {
   onFrame(cb: (frame: AudioFrame) => void): Unsubscribe;
 }
 
-/** Playback queue that can be silenced instantly. */
+/** Playback queue that can be silenced instantly. Same device as AudioInput. */
 interface AudioOutput {
   enqueue(frame: AudioFrame): void;
-  /** Drop all queued audio and silence within 50ms. */
-  flush(): void;
-  /** Milliseconds of audio actually played since the last flush. */
-  playedMs(): number;
+  /**
+   * Drop all queued audio and silence within 50ms. Resolves with the
+   * milliseconds the user actually HEARD — which is less than the audio handed
+   * to the device, because some of it was still in the hardware pipeline.
+   */
+  flush(): Promise<{ heardMs: number }>;
   isPlaying(): boolean;
 }
 
@@ -336,19 +365,94 @@ signal as reference.
 
 `AudioInput` owns this. No other component is aware of echo.
 
+**Verified working on the target machine.** A probe tone played through the render bus
+while measuring its level in the captured microphone stream, with AGC off and the tone
+frequency hopping so that noise suppression could not account for the result:
+
+| | 440 Hz | 1320 Hz | steady tone |
+|---|---|---|---|
+| AEC on | +10.4 dB | +15.6 dB | +0.7 dB |
+| AEC bypassed | +29.6 dB | +32.3 dB | +24.4 dB |
+
+An undocumented bonus, measured but not to be relied on: VPIO also attenuated audio from
+a *separate* process (`afplay`, +33.1 dB bypassed vs −7.2 dB with AEC on), which suggests
+the OS references the whole device output mix rather than only our render bus. Route
+playback through the unit regardless — the render callback's frame counter is needed for
+`heardMs` either way.
+
+### Microphone permission
+
+A plain `swiftc`-built binary with no bundle identifier **does** get microphone access and
+delivers real audio; TCC attributes the request to the responsible process (the terminal
+in development, the packaged app in production).
+
+But there is a trap that hangs the app forever: when the helper is not parented by a GUI
+process, `AVCaptureDevice.requestAccess(for: .audio)` **never calls back at all** — no
+dialog, no timeout, no error. **Never gate startup on `requestAccess`.** Start audio and
+observe whether samples arrive.
+
+Because a TCC denial delivers digital silence, which is indistinguishable from a quiet
+room, the helper runs a **silence watchdog**: if every sample is exactly zero for ~2 s, it
+reports a permission error rather than listening to nothing forever (§9).
+
+Harden the helper by embedding an `Info.plist` at link time — verified to work, and no
+`.app` bundle is required:
+
+```sh
+swiftc -O aecio.swift -o aecio \
+  -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker Helper-Info.plist
+```
+
+Ship `NSMicrophoneUsageDescription` in the **parent** app, since that is what the user is
+actually granting.
+
 ### Interrupt sequence
 
 When `TurnDetector` fires `onSpeechStart` while the Director is in `SPEAKING`:
 
-1. `AudioOutput.flush()` — silence within 50 ms.
+1. `AudioOutput.flush()` — silence within 50 ms, and it returns `heardMs` for step 4.
 2. Abort the `Voice.synthesize` stream via its `AbortSignal`.
 3. `AgentSession.interrupt()` — **not** an abort. In the Agent SDK, aborting the
    controller tears the session down and is not even prompt: the signal reaches the
    subprocess only after a graceful-close path with a ~2 s grace window. `interrupt()`
    stops the turn and leaves the session reusable, which is what barge-in needs.
-4. Compute what the user actually heard: `AudioOutput.playedMs()` mapped back to
-   the emitted text.
+4. Map the `heardMs` returned by step 1 back to the emitted text.
 5. Transition to `HEARING`.
+
+**Measured: this budget is met with room to spare.** Reaction inside the render callback
+is 8.8 ms and the flush acknowledgement reaches Node in 10 ms. The audio unavoidably in
+flight is the committed hardware buffer — 27.3 ms at the default settings — for a total
+of about **36 ms**, against the 50 ms target. Dropping `BufferFrameSize` to 256 frames
+brings it to ~25 ms if margin is wanted.
+
+The queued audio costs nothing: the ring buffer is discarded in O(1) by moving the read
+index, measured to drop 20–80 ms of backlog in a single callback.
+
+**`MaximumFramesPerSlice` must be left at its 512 default.** Raising it to 4096 makes
+VPIO batch its callbacks into 2048-frame blocks every 85 ms, and flush reaction degrades
+to 85 ms — blowing the target on its own. `BufferFrameSize` does *not* fix this; only the
+slice size controls it. This is the single easiest way to silently break barge-in:
+
+| MaximumFramesPerSlice | Callback gap | Flush reaction |
+|---|---|---|
+| 4096 | 85.4 ms | up to 85 ms |
+| **512 (default)** | **10.7 ms** | **2.3 ms** |
+| 256 | 5.4 ms | 0.9 ms |
+
+### Counting what was actually heard
+
+`kAudioUnitProperty_Latency` reports **0.0 ms** on this unit and cannot be used. Instead
+the helper counts frames actually consumed by the render callback (never counting
+zero-fill) and subtracts the device pipeline:
+
+```
+heardMs = (framesConsumed − outputLatencyFrames) / sampleRate × 1000
+```
+
+`outputLatencyFrames` is composed from device properties — device latency, safety offset,
+buffer size and stream latency — and came to 655 frames at 24 kHz on the test machine.
+Frames handed to the unit but still inside the hardware were never heard by the user, and
+telling Claude it was cut off later than it was is exactly the error §6 exists to prevent.
 
 `interrupt()` returns a receipt listing turns still queued to run. The Director must
 drain those before returning to `LISTENING`, or the agent resumes speaking about the
@@ -520,6 +624,7 @@ Voice has no error screen. Every failure must either recover silently or be spok
 | STT disconnects | Reconnect with backoff; speak "non ti ho sentito, ripeti" if a turn was lost |
 | Claude errors or rate-limits | Speak the reason briefly; stay in `LISTENING` |
 | Mic device disappears | Stop, speak once, retry every 2 s |
+| Mic returns pure digital silence for 2 s | Report a permission error. TCC denial is indistinguishable from a quiet room (§6) |
 | API key missing | Fail at startup with a terminal error, never at first speech |
 | VAD model missing | Fail at startup. Degrading to no-VAD means inventing user turns (§8) |
 | Port 8178 already bound | Fail at startup. macOS allows a second bind and splits traffic |
@@ -563,17 +668,25 @@ what it must display; the software does not change.
 
 ### Parallelizable work in M1
 
-The five leaf components share no state and are defined entirely by §3 interfaces, so
-they can be built simultaneously by separate agents:
+An earlier draft listed **five** parallel leaves, splitting `AudioInput` from
+`AudioOutput`. That split is impossible: they are one audio unit (§3). Two agents given
+those as separate tasks would have produced two `AUVoiceProcessor` instances that cannot
+coexist on one device, and the failure would have surfaced only at integration.
+
+Four leaves, then:
 
 ```
-AudioInput+AEC │ Transcriber │ AgentSession │ Voice │ AudioOutput
-───────────────┴─────────────┴──────────────┴───────┴────────────
+AudioDevice (in+out+AEC) │ Transcriber │ AgentSession │ Voice
+─────────────────────────┴─────────────┴──────────────┴──────
                              ▼
                     Director  (single-threaded, by hand)
                              ▼
                         SpeechFilter
 ```
+
+`AudioDevice` is also the largest and riskiest of the four — it is the Swift helper plus
+its wire protocol — so it should start first rather than being sized as one leaf among
+equals.
 
 The Director is written by hand after the leaves land. It is the only component with
 real logic, and debugging a subtle state-machine bug authored elsewhere while five other
@@ -605,7 +718,19 @@ components are also new is the worst possible trade.
   `sonic-3`, `sonic-3.5` and `sonic-3.6` are all live and measurably equal in latency
   (§4), so pick on voice quality; `sonic-2` and earlier return HTTP 400 "Model
   sunsetted". ElevenLabs Flash remains a drop-in alternative behind `Voice` (§3).
-- macOS VoiceProcessingIO for capture and AEC.
+- macOS **VoiceProcessingIO** for capture, playback and AEC, in a small Swift helper
+  binary that Node spawns and talks to over pipes. Wire protocol: stdin takes framed
+  commands (`audio`, `flush`, `quit`), stdout is raw PCM16 mono, stderr is one JSON event
+  per line. The ring buffers are lock-free SPSC; the render and input callbacks never
+  allocate, lock, or do I/O.
+
+  **Prerequisite:** a consistent Swift toolchain. On the target machine today, Command
+  Line Tools alone is internally inconsistent — a stale `module.modulemap` collides with
+  `bridging.modulemap`, and the CLT compiler build does not match the CLT SDK, so every
+  SDK overlay (`Foundation`, `AudioToolbox`, `CoreAudio`) fails to import. Installing
+  Xcode, or reinstalling Command Line Tools, fixes it. **This must be resolved before
+  `AudioDevice` work starts**, or the first task stalls on a toolchain problem that looks
+  like a code problem.
 - **whisper.cpp** for STT (`whisper-cpp` 1.9.2), run as a resident `whisper-server`,
   not a per-utterance invocation (§4). Measured 126–215 ms warm against 17 s cold.
   Inference runs on the **Metal GPU**, so thread count barely matters and the cost is
@@ -639,6 +764,8 @@ components are also new is the worst possible trade.
 | Plugin or standalone app? | Standalone, packaged as a plugin later | Plugins cannot receive voice input (§2) |
 | Which TTS? | Cartesia Sonic-3, behind an interface | User supplied the key; ElevenLabs stays a drop-in swap |
 | AEC now or later? | Now, in M1 | Determines whether headphones are mandatory forever |
+| Capture and playback separate? | **No — one audio unit, one task** | VPIO refuses mismatched client rates; AEC needs the playback as reference (§3) |
+| Sample rate? | 24 kHz both scopes, resample to 16 k in the helper | The 16 k/24 k split in the first draft does not initialize |
 | Read code aloud? | Never | Unusable within 30 seconds |
 | Wake word? | Not in scope | Desk use, session-scoped |
 | Buy holographic hardware now? | No | The avatar is a video; choose the display once there is something to show |
