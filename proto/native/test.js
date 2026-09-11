@@ -115,7 +115,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   console.log(`min/max             : ${min}/${max}`);
   console.log(`overall RMS         : ${rms(all).toFixed(1)}`);
   console.log(`VERDICT             : ${nonZero > 0 ? 'REAL MICROPHONE AUDIO' : 'ALL ZEROS - silence/TCC block'}`);
-  fs.writeFileSync('/tmp/vpio/mic.raw', all);
+  fs.writeFileSync('/tmp/aecio-mic.raw', all);
 
   p.stdin.write(frame('Q'));
   await sleep(300);
