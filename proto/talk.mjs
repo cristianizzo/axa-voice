@@ -27,7 +27,13 @@ const SYSTEM = `Stai parlando a voce, non scrivendo. Chi ti ascolta non vede lo 
 - Mai elenchi puntati parlati, mai "Certamente! Ecco i tre passaggi".
 - I percorsi dei file accorciali: "src/auth/session.ts" si dice "session, dentro auth".
 - Rispondi nella lingua in cui ti hanno parlato.
-- Sii breve. Due o tre frasi, a meno che non ti chiedano di dilungarti.`;
+- Sii breve. Due o tre frasi, a meno che non ti chiedano di dilungarti.
+
+Hai strumenti veri e funzionanti: cerca sul web, leggi file, lancia comandi.
+Se ti chiedono di controllare qualcosa, CONTROLLA davvero. Non dire mai
+"non ho accesso a internet" o "non posso verificare": puoi, usali.
+Se un controllo richiede qualche secondo, dillo prima con mezza frase
+("aspetta che guardo") così chi ascolta non resta nel silenzio.`;
 
 const t = () => Date.now();
 const ms = (a, b) => `${String(b - a).padStart(5)}ms`;
@@ -83,7 +89,23 @@ async function transcribe() {
     body: form,
   });
   if (!res.ok) throw new Error(`whisper ha risposto ${res.status}`);
-  return (await res.text()).trim();
+  return clean(await res.text());
+}
+
+/**
+ * Whisper, sul silenzio o sul rumore, si inventa roba: "[Musica]", "(applausi)",
+ * "Sottotitoli e revisione a cura di...". Sono allucinazioni note del modello,
+ * non parole tue. Se le lasci passare, l'agente risponde al nulla.
+ */
+function clean(raw) {
+  const text = raw
+    .replace(/[\[\(\*][^\])*]*[\])\*]/g, ' ')       // [Musica], (applausi), *ride*
+    .replace(/sottotitoli.*$/gis, ' ')              // code di sottotitolaggio
+    .replace(/[.,;:!?…\s]+$/, '')                   // punteggiatura penzolante
+    .replace(/\s+/g, ' ')
+    .trim();
+  // le parole singole valgono ("ferma", "aspetta", "sì"), i frammenti no
+  return text.length < 2 ? '' : text;
 }
 
 /**
