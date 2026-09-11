@@ -281,6 +281,49 @@ End the turn when VAD reports silence for **250 ms** *and* the partial transcrip
 stable. If VAD reports silence but the transcript looks unfinished (trailing
 conjunction, mid-clause), extend to **700 ms** before ending the turn.
 
+### Partials come from re-transcription, not streaming
+
+`whisper-server` has exactly three routes — `/health`, `/load`, `/inference` — and no
+SSE or WebSocket anywhere in the binary. There is no streaming transcript. Partials are
+produced by re-transcribing a growing buffer on a timer.
+
+Measured, this is affordable: at a **350 ms cadence** a sustained loop runs p50 167 ms
+(2 s buffer) to 220 ms (4 s buffer) with **zero overruns** and ~20 % of one core, because
+inference runs on the Metal GPU. Two settings make it comfortable:
+
+- **`audio_ctx=1000` for partials, `0` for the final.** Shrinking the encoder context is
+  ~25 % faster with no transcript change in testing. At 500 the transcript degrades.
+- **Cap the window.** Cost grows with buffer length (10 s ⇒ ~300 ms), so beyond ~6 s
+  either pin the earlier text and re-transcribe only the tail, or drop the cadence
+  to 500 ms.
+
+### Compare the stable prefix, not the whole string
+
+This is the detail that decides whether turn detection works at all. Whisper **truncates
+or invents the last word of a growing buffer** — the same utterance yielded "mi serve sa",
+then "Erichino", then "di Erie" on successive passes. A stability check that diffs the
+full string sees the tail churn on every pass and **never converges**, so the turn never
+ends.
+
+`TurnDetector` therefore drops the final one to two tokens before comparing. Measured
+partials show the prefix going stable several passes before the tail does:
+
+```
+2.5s  "Ciao, puoi controllare i log di ieri per favore?"
+3.0s  "Ciao, puoi controllare i log di ieri per favore?"   ← prefix stable, turn can end
+3.5s  "Ciao, puoi controllare i log di ieri per favore, mi serve sa"
+```
+
+### One engine, one inference at a time
+
+`whisper-server` serializes: two concurrent requests take 202 ms and 446 ms, four take up
+to 936 ms — latency stacks linearly. The partial loop and the final transcription
+therefore contend, and a running loop delays the final transcript by a measured **+76 ms**
+(203 → 279 ms).
+
+Stop issuing partials the moment the endpointer fires. If that is not enough, run two
+servers on two ports — one for partials, one for finals — at ~500 MB each.
+
 ## 6. Barge-in and echo cancellation
 
 ### Echo cancellation is a Milestone 1 requirement, not an optimization
@@ -434,9 +477,35 @@ confirmation rather than asserting it cannot happen.
 
 Whisper emits confident text for silence — `[Musica]`, `[Applausi]`, `Sottotitoli e
 revisione a cura di…` — and in the prototype this produced entire turns the user never
-spoke. `Transcriber` therefore strips bracketed markers and known subtitle boilerplate,
-and drops the result if under two characters. Short real words ("sì", "no", "ferma")
-must survive, so the filter cannot use a minimum word count.
+spoke. Every model size does it, from `base` to `large-v3-turbo`.
+
+**The decoder cannot be talked out of it.** Measured against 2 s of digital silence, every
+threshold knob is a no-op, and `--suppress-nst` actively makes things *worse* — it bans
+bracketed tokens, so the model routes the identical hallucination through ordinary words
+instead:
+
+| Setting | Result on silence |
+|---|---|
+| baseline | `[Musica]` |
+| `suppress_nst=true` | `Sottotitoli e revisione a cura di QTSS` |
+| `no_speech_thold` 0.2 / 0.05 | `[Musica]` |
+| `logprob_thold`, `entropy_thold`, no-fallback | `[Musica]` |
+
+**Silero VAD at the server fixes it at the source**, and is close to free: run
+`whisper-server --vad --vad-model ggml-silero-v5.1.2.bin`. Silence then returns `""` in
+**3–5 ms** because whisper never runs, against 128 ms of confabulation without it. Real
+speech is unaffected — measured identical transcripts and no latency penalty. For the
+partial loop of §5 this is a double win: silent partials cost 4 ms instead of 130 ms.
+
+The regex filter stays as a second line of defence. VAD gates on speechiness, so a cough
+or a keyboard clack still reaches the decoder and still becomes a sentence. It strips
+bracketed markers and subtitle boilerplate, and drops anything under two characters —
+never a minimum *word* count, because "sì", "no" and "ferma" are the whole vocabulary of
+§8's approval grammar.
+
+**Do not gate on `no_speech_prob`.** In whisper.cpp 1.9.2 it is off by one request — it
+reports the *previous* request's value — and on these samples it is inverted as well
+(silence 0.0001, speech 0.945). It looks exactly like the right signal and is unusable.
 
 Under `AWAITING_APPROVAL` this matters twice over: a hallucinated utterance reaching the
 approval grammar is exactly the failure the fail-closed rule exists to stop.
@@ -452,6 +521,8 @@ Voice has no error screen. Every failure must either recover silently or be spok
 | Claude errors or rate-limits | Speak the reason briefly; stay in `LISTENING` |
 | Mic device disappears | Stop, speak once, retry every 2 s |
 | API key missing | Fail at startup with a terminal error, never at first speech |
+| VAD model missing | Fail at startup. Degrading to no-VAD means inventing user turns (§8) |
+| Port 8178 already bound | Fail at startup. macOS allows a second bind and splits traffic |
 
 Rule: **never fail silently into a dead microphone.** A voice agent that stops
 responding is indistinguishable from one that is thinking.
@@ -535,10 +606,31 @@ components are also new is the worst possible trade.
   (§4), so pick on voice quality; `sonic-2` and earlier return HTTP 400 "Model
   sunsetted". ElevenLabs Flash remains a drop-in alternative behind `Voice` (§3).
 - macOS VoiceProcessingIO for capture and AEC.
-- **whisper.cpp** for STT, run as a resident `whisper-server` process, not a per-utterance
-  invocation (§4). Measured 126–215 ms warm against 17 s cold. Deepgram stays available
-  behind the same `Transcriber` interface if §5 turns out to need word-level streaming
-  partials that local Whisper cannot provide.
+- **whisper.cpp** for STT (`whisper-cpp` 1.9.2), run as a resident `whisper-server`,
+  not a per-utterance invocation (§4). Measured 126–215 ms warm against 17 s cold.
+  Inference runs on the **Metal GPU**, so thread count barely matters and the cost is
+  ~20 % of one core, not of all of them.
+
+  ```
+  whisper-server -m ggml-small.bin --port 8178 -l it \
+                 --vad --vad-model ggml-silero-v5.1.2.bin
+  ```
+
+  - **`ggml-small`** is the right size. Measured on conversational Italian, `medium` is
+    2.6× slower and `large-v3-turbo` 3.5× slower for no visible quality gain, and the
+    turbo models are encoder-bound (~450–550 ms regardless of buffer length), which makes
+    them a *worse* fit for a partial loop than their headline numbers suggest. Quantizing
+    turbo does not help — q5_0 measured marginally slower than f16.
+  - The **Silero VAD model is not bundled** with homebrew and must be fetched once
+    (885 KB) from `huggingface.co/ggml-org/whisper-vad`. Startup must fail loudly if it
+    is missing (§9), because without it the agent answers questions nobody asked.
+  - `POST /inference`, `multipart/form-data`, field name exactly **`file`**, and the
+    payload must be a **container — raw PCM is rejected**. Feed 16 kHz mono s16 WAV.
+    Health-check `GET /health` before use: two `whisper-server` processes can both bind
+    the same port on macOS with no error, and the kernel then splits requests between
+    them, which silently corrupted a full round of measurements during this research.
+
+  Deepgram stays available behind the same `Transcriber` interface.
 
 ## 13. Decisions made
 
@@ -550,7 +642,9 @@ components are also new is the worst possible trade.
 | Read code aloud? | Never | Unusable within 30 seconds |
 | Wake word? | Not in scope | Desk use, session-scoped |
 | Buy holographic hardware now? | No | The avatar is a video; choose the display once there is something to show |
-| Which STT? | Local whisper.cpp, resident process | Measured fast enough (126–215 ms) and free; Deepgram stays available |
+| Which STT? | Local whisper.cpp `small`, resident | Measured fast enough (126–215 ms) and free; bigger models are slower, not better |
+| Stop the silence hallucinations how? | Silero VAD at the server | The only thing that worked; decoder thresholds are no-ops and `suppress-nst` backfires |
+| Streaming partials? | Re-transcribe a growing buffer at 350 ms | whisper-server has no streaming route; measured affordable with `audio_ctx=1000` |
 | Tool permissions in voice? | Read always, write on spoken "sì" | No permission dialog exists in voice; a blocked turn hangs invisibly (§8) |
 | Misheard confirmation? | Fail closed — anything but a clear yes is a deny | Whisper hallucinates on silence; a wrong allow edits files unasked |
 | No answer at all? | Deny after 10 s | The SDK's permission callback never times out on its own |
