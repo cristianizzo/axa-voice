@@ -38,13 +38,23 @@ Se un controllo richiede qualche secondo, dillo prima con mezza frase
 const t = () => Date.now();
 const ms = (a, b) => `${String(b - a).padStart(5)}ms`;
 
-/** Registra finché l'utente non preme INVIO di nuovo. */
+/**
+ * Registra finché l'utente non preme INVIO di nuovo.
+ *
+ * Il riferimento sta fuori perché sox va ucciso anche quando usciamo a metà
+ * registrazione: sopravvive a chi l'ha lanciato e si tiene il microfono, e il
+ * prototipo successivo registra silenzio senza dire perché.
+ */
+let recorder = null;
+
 async function record(rl) {
-  const sox = spawn('sox', ['-d', '-r', '16000', '-c', '1', '-b', '16', WAV], {
+  recorder = spawn('sox', ['-d', '-r', '16000', '-c', '1', '-b', '16', WAV], {
     stdio: ['ignore', 'ignore', 'ignore'],
   });
+  const sox = recorder;
   await rl.question('\x1b[31m● registrando…\x1b[0m  INVIO per fermare ');
   sox.kill('SIGTERM');
+  recorder = null;
   await new Promise((r) => sox.on('close', r));
 }
 
@@ -160,6 +170,17 @@ function startClaude() {
       if (msg.type === 'result') { turnDone = true; wake(); continue; }
       if (msg.type !== 'stream_event') continue;
       const ev = msg.event;
+
+      // Fine di un blocco: quello che resta è una frase finita, anche se non ha
+      // niente dopo. Senza questo, l'ultima frase prima di uno strumento resta
+      // ferma: lo spezza-frasi aspetta il carattere successivo, che arriva solo
+      // quando lo strumento ha finito. Misurato: "aspetta che guardo" pronto a
+      // 4,7s, detto a 20,9s. È proprio la frase che doveva coprire l'attesa.
+      if (ev?.type === 'content_block_stop') {
+        if (buf.trim()) { queue.push(buf.trim()); buf = ''; wake(); }
+        continue;
+      }
+
       if (ev?.type !== 'content_block_delta' || ev.delta?.type !== 'text_delta') continue;
 
       buf += ev.delta.text;
@@ -323,7 +344,12 @@ async function main() {
   const warm = (async () => { for await (const _ of claude.ask('Rispondi solo: ok')) {} })();
   const server = await startWhisper();
   await warm;
-  process.on('SIGINT', () => { server?.kill(); claude.close(); process.exit(0); });
+  process.on('SIGINT', () => {
+    recorder?.kill('SIGTERM');
+    server?.kill();
+    claude.close();
+    process.exit(0);
+  });
 
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   console.log(`ctrl-c per uscire\n`);
