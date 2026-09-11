@@ -200,8 +200,21 @@ is ~1.5 s rather than 1 s.
 | Turn end detection | 250 ms | §5, not yet measured |
 | Claude first token | 1300 ms | **Measured**, warm persistent session, no MCP |
 | First speakable sentence | 100 ms | SpeechFilter emits on sentence boundary |
-| TTS first audio chunk | 100 ms | Cartesia Sonic-3 |
+| TTS first audio chunk | 150 ms | **Measured**, Cartesia WebSocket, median of 9 runs |
 | **Total** | **~1500 ms** | Enforced by automated test, §10 (Testing) |
+
+The TTS figure is a median because the spread is wide: 82–378 ms across nine runs
+(`proto/check-cartesia-ws.mjs`). Crucially, the spread does **not** track the model —
+`sonic-3`, `sonic-3.5` and `sonic-3.6` are indistinguishable once you run each more than
+once, so the model is chosen for voice quality and the variance is network jitter. The
+budget carries 150 ms and the design absorbs the tail by never blocking on it: playback
+starts on the first chunk, and sentence *n+1* is already synthesizing.
+
+`Voice` must use the **WebSocket** endpoint (`wss://api.cartesia.ai/tts/websocket`), not
+`/tts/bytes` as the prototype did. The WebSocket takes incremental `transcript` chunks
+under one `context_id` with `continue: true`, which is exactly the shape `SpeechFilter`
+emits — sentences arriving one at a time — and it returns audio before the text is
+finished. `/tts/bytes` cannot start until the whole sentence exists.
 
 Three things dominate this budget, and two were discovered by measuring, not by design:
 
@@ -437,9 +450,10 @@ components are also new is the worst possible trade.
 - TypeScript, Node.js.
 - Claude via the CLI in streaming stream-json mode, one long-lived process, reading
   `~/.claude/`. MCP servers loaded lazily, never at session start (§4).
-- **Cartesia Sonic-3** for TTS. Note that `sonic-2` and every earlier model ID now
-  return HTTP 400 "Model sunsetted"; only `sonic-3` is live. ElevenLabs Flash remains a
-  drop-in alternative behind the same `Voice` interface (§3).
+- **Cartesia** for TTS over the WebSocket endpoint, `cartesia_version: 2026-08-14`.
+  `sonic-3`, `sonic-3.5` and `sonic-3.6` are all live and measurably equal in latency
+  (§4), so pick on voice quality; `sonic-2` and earlier return HTTP 400 "Model
+  sunsetted". ElevenLabs Flash remains a drop-in alternative behind `Voice` (§3).
 - macOS VoiceProcessingIO for capture and AEC.
 - **whisper.cpp** for STT, run as a resident `whisper-server` process, not a per-utterance
   invocation (§4). Measured 126–215 ms warm against 17 s cold. Deepgram stays available
