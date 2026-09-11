@@ -129,6 +129,14 @@ function startClaude() {
     '--model', 'sonnet',
     '--append-system-prompt', SYSTEM,
     '--mcp-config', '{"mcpServers":{}}', '--strict-mcp-config',
+    // A voce non esiste la finestra di conferma: se Claude chiede il permesso
+    // per uno strumento, nessuno può cliccare e la conversazione si impianta
+    // senza che l'utente veda perché. Quindi i permessi si decidono qui.
+    //
+    // Solo strumenti che LEGGONO. Bash, Write ed Edit restano fuori di
+    // proposito: un comando shell partito da una frase sentita male non ha
+    // nessuna conferma visiva che lo fermi. Serve prima una conferma parlata.
+    '--allowedTools', 'WebSearch', 'WebFetch', 'Read', 'Glob', 'Grep', 'ToolSearch',
   ], {
     env: { ...process.env, CLAUDE_CONFIG_DIR: '/Users/cristianizzo/.claude' },
     stdio: ['pipe', 'pipe', 'ignore'],
@@ -158,7 +166,8 @@ function startClaude() {
       // taglia su fine frase: è l'unità più piccola che si può già dire,
       // e non aspetta che Claude abbia finito il resto della risposta
       let m;
-      while ((m = buf.match(/^([\s\S]*?[.!?…]["')\]]?)(\s+)/))) {
+      // fine frase seguita da spazio, oppure attaccata alla maiuscola dopo
+      while ((m = buf.match(/^([\s\S]*?[.!?…]["')\]]?)(\s+|(?=[A-ZÀ-Ý]))/))) {
         queue.push(m[1].trim());
         buf = buf.slice(m[0].length);
         wake();
