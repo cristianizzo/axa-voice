@@ -1,0 +1,3 @@
+proto/models/
+node_modules/
+.env
