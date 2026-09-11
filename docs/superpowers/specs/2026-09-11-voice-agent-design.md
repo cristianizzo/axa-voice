@@ -147,9 +147,14 @@ interface Voice {
   ): AsyncIterable<AudioFrame>;
 }
 
-/** Claude, via one long-lived CLI process, reading ~/.claude config. */
+/** Claude, via one long-lived Agent SDK session, reading ~/.claude config. */
 interface AgentSession {
-  send(text: string, signal: AbortSignal): AsyncIterable<AgentEvent>;
+  send(text: string): AsyncIterable<AgentEvent>;
+  /**
+   * Stop the turn in flight and keep the session usable. NOT an AbortSignal:
+   * aborting tears the session down and is not instant (§6).
+   */
+  interrupt(): Promise<void>;
   /** Tell Claude it was cut off, and with what. See §6. */
   notifyInterruption(spokenSoFar: string, userSaid: string): void;
   /** Asked before any write/execute tool runs. The Director answers by voice. See §8. */
@@ -273,10 +278,17 @@ When `TurnDetector` fires `onSpeechStart` while the Director is in `SPEAKING`:
 
 1. `AudioOutput.flush()` — silence within 50 ms.
 2. Abort the `Voice.synthesize` stream via its `AbortSignal`.
-3. Abort the in-flight `AgentSession.send` stream.
+3. `AgentSession.interrupt()` — **not** an abort. In the Agent SDK, aborting the
+   controller tears the session down and is not even prompt: the signal reaches the
+   subprocess only after a graceful-close path with a ~2 s grace window. `interrupt()`
+   stops the turn and leaves the session reusable, which is what barge-in needs.
 4. Compute what the user actually heard: `AudioOutput.playedMs()` mapped back to
    the emitted text.
 5. Transition to `HEARING`.
+
+`interrupt()` returns a receipt listing turns still queued to run. The Director must
+drain those before returning to `LISTENING`, or the agent resumes speaking about the
+thing the user just interrupted.
 
 ### Telling Claude it was cut off
 
@@ -369,6 +381,34 @@ wrong allow is an edited file the user never asked for.
 Approval is per call, never remembered. There is no "always allow" in voice, because the
 user cannot see what they would be agreeing to for the rest of the session.
 
+### The permission prompt must time out
+
+The Agent SDK's permission callback **has no deadline of its own**: if the handler never
+resolves, the tool stays blocked and the session waits forever. In a text UI that is
+fine, because the prompt sits on screen until someone answers. In a voice UI the user can
+simply walk away, and the failure is invisible — a silent agent is indistinguishable from
+a thinking one (§9).
+
+So the Director starts a **10 s timer** when it asks. On expiry it denies, says so out
+loud ("lascio stare, non ho sentito"), and returns to `LISTENING`. This is the same
+fail-closed rule as a misheard answer, applied to no answer at all.
+
+### Say the SDK's own sentence
+
+The permission callback supplies a pre-rendered `title` — "Claude wants to read foo.txt"
+— and a short `displayName`. Use `title` as the basis for the spoken line rather than
+reconstructing one from the tool name and its raw input. It already accounts for tools
+whose arguments do not read back sensibly, and it is maintained upstream. Pass it through
+the §7 spoken-form rules (path shortening) before speaking.
+
+### Not every tool can be pre-approved
+
+`allowedTools` suppresses the permission callback for the tools it names — this is what
+makes the read-only tier work. But a small set of sensitive actions reaches the callback
+regardless of any allow rule. The Director must therefore treat a permission request for
+a *read-only* tool as possible, not as a bug, and handle it with the same spoken
+confirmation rather than asserting it cannot happen.
+
 ### Hallucinated input
 
 Whisper emits confident text for silence — `[Musica]`, `[Applausi]`, `Sottotitoli e
@@ -447,9 +487,26 @@ components are also new is the worst possible trade.
 
 ## 12. Stack
 
-- TypeScript, Node.js.
-- Claude via the CLI in streaming stream-json mode, one long-lived process, reading
-  `~/.claude/`. MCP servers loaded lazily, never at session start (§4).
+- TypeScript, Node.js 22 (ESM — the SDK ships ESM only).
+- Claude via **`@anthropic-ai/claude-agent-sdk`**, one long-lived session in streaming
+  input mode, pre-warmed with `startup()` so process spawn is off the critical path.
+
+  Session options are load-bearing for §4 and must be set explicitly:
+
+  | Option | Value | Why |
+  |---|---|---|
+  | `strictMcpConfig` | `true` | Ignores project, user, and plugin MCP config |
+  | `mcpServers` | `{}` | Nothing to connect — removes the 5–7 s/turn cost |
+  | `settingSources` | `['user']` | Keeps the user's skills and agents from `~/.claude/` |
+  | `includePartialMessages` | `true` | Token deltas; without it, text arrives in blocks |
+  | `systemPrompt` | `{type:'preset', preset:'claude_code', append: …}` | A bare string **replaces** the preset rather than appending |
+
+  `settingSources` now defaults to loading **all** sources, so omitting it silently
+  restores the user's MCP servers and the latency with them. It must be written out.
+
+  Stream deltas are emitted for the main session only — **subagent output arrives as
+  whole messages**, so any turn that dispatches a subagent will speak in one late burst
+  unless the Director emits filler (§4).
 - **Cartesia** for TTS over the WebSocket endpoint, `cartesia_version: 2026-08-14`.
   `sonic-3`, `sonic-3.5` and `sonic-3.6` are all live and measurably equal in latency
   (§4), so pick on voice quality; `sonic-2` and earlier return HTTP 400 "Model
@@ -473,4 +530,6 @@ components are also new is the worst possible trade.
 | Which STT? | Local whisper.cpp, resident process | Measured fast enough (126–215 ms) and free; Deepgram stays available |
 | Tool permissions in voice? | Read always, write on spoken "sì" | No permission dialog exists in voice; a blocked turn hangs invisibly (§8) |
 | Misheard confirmation? | Fail closed — anything but a clear yes is a deny | Whisper hallucinates on silence; a wrong allow edits files unasked |
+| No answer at all? | Deny after 10 s | The SDK's permission callback never times out on its own |
+| Stop a turn mid-flight? | `interrupt()`, never `abort()` | Abort kills the session and takes ~2 s; interrupt is instant and reusable |
 | Remember an approval? | Never; per call only | The user cannot see what they would be agreeing to |
