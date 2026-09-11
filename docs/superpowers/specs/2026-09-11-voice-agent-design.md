@@ -1,14 +1,17 @@
 # axa-voice — Design
 
 **Date:** 2026-09-11
-**Status:** Approved (sections 1–4)
+**Status:** Approved. Revised 2026-09-11 with measurements from the M0 prototype
+(`proto/talk.mjs`) — §4 latency, §8 tool permissions, §12 stack.
 
 ## In breve (IT)
 
-Un'app che ti fa **parlare con Claude a voce**: parli, lui risponde entro circa un secondo,
-e puoi interromperlo a metà frase come faresti con una persona. Gira a casse aperte
-(niente cuffie obbligatorie) perché cancella l'eco delle proprie casse dal microfono.
-Non legge mai il codice ad alta voce: quello resta a schermo, a voce arriva solo il senso.
+Un'app che ti fa **parlare con Claude a voce**: parli, lui risponde in circa un secondo
+e mezzo, e puoi interromperlo a metà frase come faresti con una persona. Gira a casse
+aperte (niente cuffie obbligatorie) perché cancella l'eco delle proprie casse dal
+microfono. Non legge mai il codice ad alta voce: quello resta a schermo, a voce arriva
+solo il senso. **Legge sempre** (file, web) senza chiedere; per **scrivere o eseguire**
+ti chiede a voce e aspetta un "sì" — e se non capisce bene, dice di no.
 Più avanti lo stesso flusso audio pilota un avatar 3D e poi un proiettore olografico.
 
 ---
@@ -21,7 +24,8 @@ speak instead of typing, hear the answer, interrupt mid-sentence and be understo
 The target is not "text-to-speech on top of Claude". The target is the quality gap
 between Siri and a person, which is produced by three things and not by voice timbre:
 
-1. **Time to first sound** under ~1s (Siri: ~2s).
+1. **Time to first sound** under ~1.5 s (Siri: ~2 s). See §4 — the original ~1 s target
+   was an estimate; 1.5 s is what the hardware and the model actually deliver.
 2. **Barge-in** — interrupting works, and the agent knows where it was cut off.
 3. **Spoken-appropriate content** — it says the meaning, not the code.
 
@@ -68,7 +72,8 @@ Eight components. Seven are deliberately stupid; one (the Director) holds all th
               │                ▼                          ▼
               │        ┌───────────────────────────────────────┐
               │        │             DIRECTOR                  │
-              │        │   LISTENING→HEARING→THINKING→SPEAKING │
+              │        │  LISTENING→HEARING→THINKING→SPEAKING  │
+              │        │        └────── AWAITING_APPROVAL ─────┤
               │        └───────────────────────────────────────┘
               │                │                          │
               │                ▼                          ▼
@@ -142,16 +147,26 @@ interface Voice {
   ): AsyncIterable<AudioFrame>;
 }
 
-/** Claude, via the Agent SDK, reading ~/.claude config. */
+/** Claude, via one long-lived CLI process, reading ~/.claude config. */
 interface AgentSession {
   send(text: string, signal: AbortSignal): AsyncIterable<AgentEvent>;
   /** Tell Claude it was cut off, and with what. See §6. */
   notifyInterruption(spokenSoFar: string, userSaid: string): void;
+  /** Asked before any write/execute tool runs. The Director answers by voice. See §8. */
+  onPermissionRequest(
+    handler: (req: PermissionRequest) => Promise<boolean>,
+  ): void;
 }
 type AgentEvent =
   | { type: 'text'; delta: string }
   | { type: 'tool'; name: string; phase: 'start' | 'end' }
   | { type: 'done' };
+/** What the Director must be able to say out loud in one short line. */
+interface PermissionRequest {
+  tool: string;
+  /** Already in spoken form per §7 — "session.ts, dentro auth", not a full path. */
+  summary: string;
+}
 
 /** Turns agent output into what is worth saying out loud. See §7. */
 interface SpeechFilter {
@@ -174,22 +189,43 @@ is a config change plus one new class.
 
 Time from the user falling silent to the first sound leaving the speakers.
 
-| Stage | Budget | Note |
-|---|---|---|
-| Transcription | 0 ms | Runs during speech; text is ready on silence |
-| Turn end detection | 250 ms | §5 |
-| Claude first token | 450 ms | Network + model |
-| First speakable sentence | 100 ms | SpeechFilter emits on sentence boundary |
-| TTS first audio chunk | 200 ms | ElevenLabs Flash |
-| **Total** | **~1000 ms** | Enforced by automated test, §9 |
+Figures below are **measured on the target machine** with the M0 prototype
+(`proto/talk.mjs`), not estimated. An earlier draft of this spec assumed 450 ms for
+Claude's first token; the real figure is roughly three times that, so the honest target
+is ~1.5 s rather than 1 s.
 
-Overlap is the whole design. Nothing waits for a complete answer:
+| Stage | Budget | Basis |
+|---|---|---|
+| Transcription | 0 ms | Runs during speech. Measured 126–215 ms when run after the fact |
+| Turn end detection | 250 ms | §5, not yet measured |
+| Claude first token | 1300 ms | **Measured**, warm persistent session, no MCP |
+| First speakable sentence | 100 ms | SpeechFilter emits on sentence boundary |
+| TTS first audio chunk | 100 ms | Cartesia Sonic-3 |
+| **Total** | **~1500 ms** | Enforced by automated test, §10 (Testing) |
+
+Three things dominate this budget, and two were discovered by measuring, not by design:
+
+- **The session must be a single long-lived process.** Spawning per turn costs ~1 s more
+  (2.4 s vs 1.37 s to first token).
+- **MCP servers must load lazily.** They reconnect on every session start, and the
+  user's configured servers cost **5–7 s per turn**. With them eager-loaded, no other
+  optimisation matters. Not in the original design.
+- **The STT model must stay resident.** Cold-loading Whisper per utterance costs 17 s
+  against 0.15 s warm. `Transcriber` therefore owns a process, not a function call.
+
+Overlap is the rest of the design. Nothing waits for a complete answer:
 
 - The **first complete sentence** goes to TTS while Claude is still generating.
 - Sentence *n+1* synthesizes while sentence *n* plays, so playback never gaps.
 - If the first token has not arrived within **1200 ms** (typically because Claude is
   running tools), the Director emits a filler line — "aspetta che guardo" — through the
-  same path. Filler is a Director decision, not a Voice or Filter concern.
+  same path. **Filler is a Director decision, not a Voice or Filter concern.**
+
+  The prototype proved why. Asked to check the weather, the model was instructed to
+  narrate before a slow tool call, and it did emit "aspetta che controllo" — but only
+  in the same burst as the finished answer, 15 s later. A model cannot announce that it
+  is thinking, because by the time it writes anything it has stopped. Only the Director
+  can see 1200 ms of silence while it happens.
 
 ## 5. Turn detection
 
@@ -274,7 +310,64 @@ short sentences, contractions, no spoken bullet lists, no "Certainly! Here are t
 steps", and natural hesitation while working. More realism is won here than by choosing
 a TTS vendor.
 
-## 8. Error handling
+## 8. Tool permissions
+
+A voice session has no surface for a permission dialog. The prototype proved the
+consequence: asked to search the web, Claude hit a permission prompt that nobody could
+see or answer, and the turn hung until it gave up and said "non ho il permesso attivato".
+A blocked tool in voice is indistinguishable from a crash.
+
+So permission cannot be resolved at the moment the tool is called. It must be decided
+in advance, by category.
+
+| Tool class | Examples | Policy |
+|---|---|---|
+| Read-only | `Read`, `Glob`, `Grep`, `WebSearch`, `WebFetch`, `ToolSearch` | Pre-approved. Never prompts |
+| Write / execute | `Write`, `Edit`, `Bash`, `NotebookEdit` | Spoken confirmation required |
+| Never | Anything not in the two lists above | Denied; Director speaks the refusal |
+
+The allowlist is passed at session start (`--allowedTools` in the prototype). Read-only
+tools are safe to pre-approve because their worst case is wasted time, and the user is
+present and listening.
+
+### Spoken confirmation
+
+Write and execute tools run through a permission MCP server (`canUseTool`) that the
+Director owns. When a call arrives:
+
+1. The Director abandons whatever it was about to say and speaks the intent in one
+   short line: *"vuoi che scriva su session.ts?"*
+2. It transitions to `AWAITING_APPROVAL`, which listens exactly like `LISTENING` but
+   routes the next transcript differently.
+3. That transcript is matched against an approval grammar before it is treated as a
+   normal turn.
+
+| Heard | Result |
+|---|---|
+| "sì", "vai", "fallo", "ok" | Allow, once, for this call only |
+| "no", "ferma", "lascia stare" | Deny; the denial reason goes back to Claude so it can adapt |
+| Anything else | **Treated as denial**, and the utterance becomes the next user turn |
+
+The third row is the important one. A misheard confirmation must never become an
+accidental `yes` — Whisper hallucinates on silence (§ below), so an unrecognised sound
+has to fail closed. The cost of a wrong deny is one repeated sentence; the cost of a
+wrong allow is an edited file the user never asked for.
+
+Approval is per call, never remembered. There is no "always allow" in voice, because the
+user cannot see what they would be agreeing to for the rest of the session.
+
+### Hallucinated input
+
+Whisper emits confident text for silence — `[Musica]`, `[Applausi]`, `Sottotitoli e
+revisione a cura di…` — and in the prototype this produced entire turns the user never
+spoke. `Transcriber` therefore strips bracketed markers and known subtitle boilerplate,
+and drops the result if under two characters. Short real words ("sì", "no", "ferma")
+must survive, so the filter cannot use a minimum word count.
+
+Under `AWAITING_APPROVAL` this matters twice over: a hallucinated utterance reaching the
+approval grammar is exactly the failure the fail-closed rule exists to stop.
+
+## 9. Error handling
 
 Voice has no error screen. Every failure must either recover silently or be spoken.
 
@@ -289,23 +382,25 @@ Voice has no error screen. Every failure must either recover silently or be spok
 Rule: **never fail silently into a dead microphone.** A voice agent that stops
 responding is indistinguishable from one that is thinking.
 
-## 9. Testing
+## 10. Testing
 
 Physical audio is replaced at the edges: `AudioInput` is fed a WAV file, `AudioOutput`
 records to a buffer. Everything between is ordinary testable code.
 
 Three tests carry most of the value:
 
-1. **Latency** — feed a WAV, measure to first output frame, assert < 1000 ms.
+1. **Latency** — feed a WAV, measure to first output frame, assert < 1500 ms (§4).
 2. **Barge-in** — start playback, inject speech at t=500 ms, assert output silent within
    50 ms and that `notifyInterruption` received the correct heard-prefix.
 3. **Director** — the state machine alone against fakes for all seven other components.
    This is where the real bugs live.
+4. **Fail-closed approval** — in `AWAITING_APPROVAL`, feed a hallucinated
+   transcript and assert the tool call is denied, not allowed (§8).
 
 Plus: an **echo loopback test** feeding `AudioOutput` back into `AudioInput` to assert
 the agent does not interrupt itself. TDD throughout.
 
-## 10. Milestones
+## 11. Milestones
 
 **M1 — the loop.** mic → Claude → voice, with AEC and barge-in. Launched as
 `axa-voice`. No avatar, no wake word, no plugin. This either works or the project does
@@ -337,24 +432,31 @@ The Director is written by hand after the leaves land. It is the only component 
 real logic, and debugging a subtle state-machine bug authored elsewhere while five other
 components are also new is the worst possible trade.
 
-## 11. Stack
+## 12. Stack
 
 - TypeScript, Node.js.
-- Claude via the Agent SDK, streaming, reading `~/.claude/`.
-- **ElevenLabs Flash** for TTS (chosen for expressiveness; swappable per §3).
+- Claude via the CLI in streaming stream-json mode, one long-lived process, reading
+  `~/.claude/`. MCP servers loaded lazily, never at session start (§4).
+- **Cartesia Sonic-3** for TTS. Note that `sonic-2` and every earlier model ID now
+  return HTTP 400 "Model sunsetted"; only `sonic-3` is live. ElevenLabs Flash remains a
+  drop-in alternative behind the same `Voice` interface (§3).
 - macOS VoiceProcessingIO for capture and AEC.
-- **Deepgram** for streaming STT (lowest-latency streaming API with word-level partials,
-  which §5 needs for transcript-stability turn detection). Swappable per §3; a local
-  Whisper implementation of `Transcriber` is the intended escape hatch.
+- **whisper.cpp** for STT, run as a resident `whisper-server` process, not a per-utterance
+  invocation (§4). Measured 126–215 ms warm against 17 s cold. Deepgram stays available
+  behind the same `Transcriber` interface if §5 turns out to need word-level streaming
+  partials that local Whisper cannot provide.
 
-## 12. Decisions made
+## 13. Decisions made
 
 | Question | Decision | Reason |
 |---|---|---|
 | Plugin or standalone app? | Standalone, packaged as a plugin later | Plugins cannot receive voice input (§2) |
-| Which TTS? | ElevenLabs, behind an interface | User choice; cost/privacy exit stays open |
+| Which TTS? | Cartesia Sonic-3, behind an interface | User supplied the key; ElevenLabs stays a drop-in swap |
 | AEC now or later? | Now, in M1 | Determines whether headphones are mandatory forever |
 | Read code aloud? | Never | Unusable within 30 seconds |
 | Wake word? | Not in scope | Desk use, session-scoped |
 | Buy holographic hardware now? | No | The avatar is a video; choose the display once there is something to show |
-| Which STT? | Deepgram, behind an interface | Word-level streaming partials; local Whisper stays available |
+| Which STT? | Local whisper.cpp, resident process | Measured fast enough (126–215 ms) and free; Deepgram stays available |
+| Tool permissions in voice? | Read always, write on spoken "sì" | No permission dialog exists in voice; a blocked turn hangs invisibly (§8) |
+| Misheard confirmation? | Fail closed — anything but a clear yes is a deny | Whisper hallucinates on silence; a wrong allow edits files unasked |
+| Remember an approval? | Never; per call only | The user cannot see what they would be agreeing to |
