@@ -10,6 +10,13 @@ import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline/promises';
 import { unlink, writeFile, readFile } from 'node:fs/promises';
 
+// Le chiavi stanno in .env, che git ignora. Mai nel codice.
+try {
+  process.loadEnvFile(new URL('../.env', import.meta.url).pathname);
+} catch {
+  // nessun .env: si usa la voce di macOS
+}
+
 const MODEL = new URL('./models/ggml-small.bin', import.meta.url).pathname;
 const AXA = '/Users/cristianizzo/Developers/axa-chat/cli-dev';
 const WAV = '/tmp/axa-voice-in.wav';
@@ -177,13 +184,51 @@ function speakable(text) {
  * La voce. Nello spec è un'interfaccia sostituibile: qui si vede perché.
  * Se metti ELEVENLABS_API_KEY nell'ambiente, cambia da sola.
  */
-const voice = process.env.ELEVENLABS_API_KEY ? elevenlabs : macSay;
+const voice = process.env.CARTESIA_API_KEY ? cartesia
+  : process.env.ELEVENLABS_API_KEY ? elevenlabs
+  : macSay;
+const voiceName = voice === cartesia ? 'Cartesia'
+  : voice === elevenlabs ? 'ElevenLabs'
+  : 'macOS say (metti una chiave in .env per sentire la differenza)';
 
 function macSay(text) {
   return new Promise((resolve) => {
     const s = spawn('say', ['-r', '190', text]);
     s.on('close', resolve);
   });
+}
+
+/** Riproduce un file audio e lo cancella. */
+async function play(file) {
+  await new Promise((r) => spawn('afplay', [file]).on('close', r));
+  await unlink(file).catch(() => {});
+}
+
+async function cartesia(text) {
+  // voci italiane disponibili: node proto/check-cartesia.mjs
+  const VOICE_ID = process.env.CARTESIA_VOICE_ID || 'c8403b5c-6465-4396-9065-a440d376528a';
+  const res = await fetch('https://api.cartesia.ai/tts/bytes', {
+    method: 'POST',
+    headers: {
+      'X-API-Key': process.env.CARTESIA_API_KEY,
+      'Cartesia-Version': '2024-11-13',
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({
+      model_id: 'sonic-3',
+      transcript: text,
+      voice: { mode: 'id', id: VOICE_ID },
+      output_format: { container: 'wav', encoding: 'pcm_s16le', sample_rate: 24000 },
+      language: 'it',
+    }),
+  });
+  if (!res.ok) {
+    console.error(`\x1b[31mCartesia ha risposto ${res.status}: ${await res.text()}\x1b[0m`);
+    return macSay(text);
+  }
+  const f = `/tmp/axa-voice-out-${Date.now()}.wav`;
+  await writeFile(f, Buffer.from(await res.arrayBuffer()));
+  await play(f);
 }
 
 async function elevenlabs(text) {
@@ -203,10 +248,9 @@ async function elevenlabs(text) {
     console.error(`\x1b[31mElevenLabs ha risposto ${res.status}, uso la voce di macOS\x1b[0m`);
     return macSay(text);
   }
-  const mp3 = `/tmp/axa-voice-out-${Date.now()}.mp3`;
-  await writeFile(mp3, Buffer.from(await res.arrayBuffer()));
-  await new Promise((r) => spawn('afplay', [mp3]).on('close', r));
-  await unlink(mp3).catch(() => {});
+  const f = `/tmp/axa-voice-out-${Date.now()}.mp3`;
+  await writeFile(f, Buffer.from(await res.arrayBuffer()));
+  await play(f);
 }
 
 /** Un turno: testo -> frasi dette a voce. Stampa i tempi. */
@@ -230,7 +274,7 @@ async function turn(claude, heard, t0, t1) {
 
 async function main() {
   console.log(`\x1b[1maxa-voice — prototipo\x1b[0m`);
-  console.log(`voce: ${voice === macSay ? 'macOS say (metti ELEVENLABS_API_KEY per sentire la differenza)' : 'ElevenLabs'}`);
+  console.log(`voce: ${voiceName}`);
 
   const claude = startClaude();
 
