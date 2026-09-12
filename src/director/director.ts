@@ -175,6 +175,16 @@ export class Director {
    * duration, skewing the prefix even though `#answerFromMs` never moved.
    */
   #asideMs = 0;
+  /**
+   * Where the aside sits in the `#enqueuedMs` timeline, as [start, end] spans.
+   *
+   * `#asideMs` is the total enqueued; this is its position, which is what lets
+   * a barge-in's `heardMs` be split into "aside rendered" and "aside still
+   * queued". A span is one contiguous burst — a single progress line — but a
+   * turn can hold several, separated by answer frames, so a lone end position
+   * would not say which frames belonged to the aside.
+   */
+  #asideSpans: Array<[number, number]> = [];
 
   /** What the user heard before cutting in, waiting for what they say next. */
   #pendingNote: string | undefined;
@@ -349,13 +359,24 @@ export class Director {
     const answerMs = this.#enqueuedMs - this.#answerFromMs - this.#asideMs;
     if (!text || answerMs <= 0) return '';
 
-    // `#asideMs` counts aside audio enqueued, not rendered, so barging in
-    // mid-aside subtracts a full aside the user only partly heard, and
-    // `heardOfAnswer` under-counts by the unplayed remainder. That is the safe
-    // direction: §6 exists to stop the note from claiming the user heard more
-    // than they did, and a short prefix does not. The `Math.min` below is an
-    // upper clamp against `answerMs` — it has nothing to do with this case.
-    const heardOfAnswer = Math.min(heardMs - this.#answerFromMs - this.#asideMs, answerMs);
+    // `#asideMs` counts aside audio enqueued, not rendered, while `heardMs`
+    // counts only what left the queue. Subtracting the full enqueued aside when
+    // part of it is still queued drives `heardOfAnswer` negative and the note
+    // comes back empty for an answer the user plainly heard — the empty-note
+    // defect this model exists to fix, not a safe margin. So subtract only the
+    // aside that was actually rendered: each block contributes its overlap with
+    // the rendered prefix [0, heardMs]. Over-subtracting is that bug;
+    // under-subtracting would over-report, which §5 exists to prevent. The
+    // `Math.min` below is the upper clamp against `answerMs`, separate from it.
+    let renderedAside = 0;
+    for (const [start, end] of this.#asideSpans) {
+      renderedAside += Math.max(0, Math.min(end, heardMs) - start);
+    }
+
+    const heardOfAnswer = Math.min(
+      Math.max(0, heardMs - this.#answerFromMs - renderedAside),
+      answerMs,
+    );
     if (heardOfAnswer <= 0) return '';
     if (heardOfAnswer >= answerMs) return text;
 
@@ -490,6 +511,7 @@ export class Director {
     // lands, so a filler played in between is not counted as answer.
     this.#answerFromMs = this.#enqueuedMs;
     this.#asideMs = 0;
+    this.#asideSpans = [];
     this.#toolsRunning = 0;
 
     const director = this;
@@ -563,6 +585,7 @@ export class Director {
         this.#answerFromMs = this.#enqueuedMs;
         // Everything the Director said up to here is already behind the mark.
         this.#asideMs = 0;
+        this.#asideSpans = [];
         for (const sink of sinks) sink.onSpeechStart();
       }
       await this.#waitForRoom(signal, id);
@@ -597,7 +620,13 @@ export class Director {
   #emit(frame: AudioFrame, sinks: OutputSink[], kind: 'answer' | 'aside'): void {
     const ms = (frame.length / this.#deps.config.audio.deviceRate) * 1000;
     this.#enqueuedMs += ms;
-    if (kind === 'aside') this.#asideMs += ms;
+    if (kind === 'aside') {
+      const start = this.#enqueuedMs - ms;
+      this.#asideMs += ms;
+      const last = this.#asideSpans.at(-1);
+      if (last !== undefined && last[1] === start) last[1] = this.#enqueuedMs;
+      else this.#asideSpans.push([start, this.#enqueuedMs]);
+    }
     this.#deps.audioOut.enqueue(frame);
     for (const sink of sinks) sink.onAudio(frame);
   }

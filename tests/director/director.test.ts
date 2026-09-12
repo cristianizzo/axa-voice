@@ -586,6 +586,46 @@ test('a line spoken between two sentences is not heard answer', async () => {
   await d.stop();
 });
 
+test('a barge-in mid-progress-line keeps the answer already heard', async () => {
+  const f = makeFakes(config);
+  const director = new Director(f.deps);
+  await director.start();
+
+  f.turns.speechStart();
+  f.transcriber.final('quando gioca il napoli');
+  f.turns.turnEnd();
+  await f.tick();
+  f.agent.emitText('Aspetta, controllo.');
+  await f.tick();
+  assert.equal(director.state, 'SPEAKING');
+
+  // The answer has fully rendered before the tool starts; then the wait is
+  // narrated by a progress line enqueued while the tool is still running.
+  const answerEndMs = f.audioOut.enqueuedMs;
+  f.agent.emitTool('WebSearch', 'start');
+  await f.tick();
+  f.advance(3000);
+  await f.tick();
+  const asideEndMs = f.audioOut.enqueuedMs;
+
+  // The user cuts in during the line's first word: the whole line is still
+  // queued, so flush() discards it and reports only the answer as heard.
+  f.audioOut.pendingMs = asideEndMs - answerEndMs;
+  f.turns.speechStart();
+  await f.tick();
+  f.transcriber.final('allora');
+  f.turns.turnEnd();
+  await f.tick();
+
+  assert.equal(
+    f.agent.interruptionNote!.spokenSoFar,
+    'Aspetta, controllo.',
+    'the answer that was actually heard must survive, not be reported as nothing',
+  );
+
+  await director.stop();
+});
+
 test('a long answer waits for the speakers instead of overflowing the queue', async () => {
   const f = makeFakes(config);
   const director = new Director(f.deps);
