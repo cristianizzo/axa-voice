@@ -275,17 +275,38 @@ export class Director {
   }
 
   async #onTurnEnd(): Promise<void> {
-    if (this.#state === 'THINKING') {
+    // The utterance is over whatever it turns out to be, so capture stops here
+    // — on every path out of this method, including the ones that route
+    // nothing. Cleared up front rather than once a route has been chosen
+    // because every route below has an await in it: leaving it set across that
+    // await is what would feed whisper for the rest of the answer, and setting
+    // it after would clobber a fresh onset that arrived inside the await.
+    this.#capturing = false;
+
+    // A turn still in flight. THINKING is the obvious case; SPEAKING is reached
+    // when speech that began while the agent was working outlasts the answer's
+    // first sentence, because #run flips the state the moment that sentence
+    // exists. Under an ordinary barge-in the state is already HEARING by the
+    // time a transcript exists, so this branch only ever sees capture that
+    // began while the agent was working — a follow-up, routed as one. §1's
+    // table omits SPEAKING only because it assumed barge-in had already moved
+    // the state to HEARING; that does not hold for capture that started
+    // earlier, and dropping the utterance here is how it gets lost.
+    if (this.#state === 'THINKING' || this.#state === 'SPEAKING') {
       const id = this.#turnId;
       const said = await this.#takeFinal();
-      // Forcing the final transcription is a round trip; a barge-in, a stop
-      // command, or stop() itself can all land inside it.
+      // Forcing the final transcription is a round trip; a barge-in, an audio
+      // failure or stop() can all land inside it.
       if (this.#turnId !== id) return;
-      this.#capturing = false;
       if (isStopCommand(said)) {
         this.#turnId++;
         this.#tts?.abort();
         this.#stopFiller();
+        // A permission request can have arrived inside the await above without
+        // bumping #turnId. Leaving it unresolved strands the SDK's canUseTool
+        // promise with its timer armed, and approvalTimeoutMs later it speaks
+        // GAVE_UP into a moment that has nothing to do with it.
+        this.#resolveApproval(false);
         void this.#deps.agent.interrupt();
         this.#state = 'LISTENING';
         return;
@@ -303,7 +324,6 @@ export class Director {
     // afterwards would answer a question that no longer exists, or start a turn
     // out of a state that has already moved on.
     if (this.#turnId !== id) return;
-    this.#capturing = false;
 
     if (this.#state === 'AWAITING_APPROVAL') {
       this.#answer(text);

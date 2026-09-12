@@ -43,13 +43,28 @@ test('speech while thinking does not interrupt the turn', async () => {
   await f.tick();
   assert.equal(d.state, 'THINKING');
 
+  // An agent at work is not a user talking: the room is still silent.
+  f.audioIn.frame();
+  assert.equal(f.transcriber.current!.pushed.length, 0, 'THINKING alone does not capture');
+
   // The prompt that used to kill the search.
   f.turns.speechStart();
+  f.audioIn.frame();
+  assert.equal(
+    f.transcriber.current!.pushed.length,
+    1,
+    'but THINKING must record the user, which is the whole point of not barging in',
+  );
   f.transcriber.final('allora');
   f.turns.turnEnd();
   await f.tick();
   assert.equal(f.agent.interrupts, 0, 'thinking is not interruptible');
   assert.equal(d.state, 'THINKING', 'the turn survives');
+
+  // ...and capture stops with the utterance, rather than running for the
+  // lifetime of the answer.
+  f.audioIn.frame();
+  assert.equal(f.transcriber.current!.pushed.length, 0, 'a routed turn ends capture');
 
   await d.stop();
 });
@@ -66,10 +81,60 @@ test('speech while speaking still interrupts', async () => {
   await f.tick();
   assert.equal(d.state, 'SPEAKING');
 
+  f.audioIn.frame();
+  assert.equal(f.transcriber.current!.pushed.length, 0, 'an answer playing is not speech to record');
+
   f.turns.speechStart();
+  f.audioIn.frame();
   f.transcriber.final('no aspetta');
   await f.tick();
   assert.equal(f.agent.interrupts, 1, 'barge-in is the whole point of the project');
+  assert.equal(f.transcriber.current!.pushed.length, 1, 'and what was said over it is captured');
+
+  await d.stop();
+});
+
+test('speech that outlasts the first sentence is a follow-up, not a dropped turn', async () => {
+  const f = makeFakes(config);
+  const d = new Director(f.deps);
+  await d.start();
+  f.turns.speechStart();
+  f.transcriber.final('cerca il meteo');
+  f.turns.turnEnd();
+  await f.tick();
+  assert.equal(d.state, 'THINKING');
+
+  // The user starts talking while the agent works, then the answer's first
+  // sentence lands mid-utterance: #run flips the state under them. Nothing
+  // about what they are saying changed, so nothing about its routing may.
+  f.turns.speechStart();
+  f.audioIn.frame();
+  f.agent.emitText('A Valenza ci sono venti gradi.');
+  await f.tick();
+  assert.equal(d.state, 'SPEAKING', 'the answer started while they were still talking');
+  f.audioIn.frame();
+  assert.equal(f.transcriber.current!.pushed.length, 2, 'capture survives the state flip');
+
+  const streams = f.transcriber.opened.length;
+  f.transcriber.final('e domani');
+  f.turns.turnEnd();
+  await f.tick();
+
+  // Nothing drains the queue until the next task, so the observable proof that
+  // the utterance was routed rather than dropped is that it was collected at
+  // all: the final transcription is forced, which closes the stream and opens
+  // its replacement. A dropped turn returns before any of that happens.
+  assert.equal(f.transcriber.opened.length, streams + 1, 'the utterance was taken, not dropped');
+  assert.equal(f.transcriber.opened.at(-2)!.closed, true, 'and the final was forced out of whisper');
+  assert.equal(f.agent.interrupts, 0, 'a follow-up still does not cancel the work');
+  assert.equal(d.state, 'SPEAKING', 'the answer keeps playing');
+
+  f.audioIn.frame();
+  assert.equal(
+    f.transcriber.current!.pushed.length,
+    0,
+    'capture must stop with the utterance, not run for the length of the answer',
+  );
 
   await d.stop();
 });
@@ -84,11 +149,48 @@ test('a bare stop command while thinking cancels the turn', async () => {
   await f.tick();
 
   f.turns.speechStart();
+  f.audioIn.frame();
+  assert.equal(f.transcriber.current!.pushed.length, 1, 'the stop word has to reach whisper first');
   f.transcriber.final('basta');
   f.turns.turnEnd();
   await f.tick();
   assert.equal(f.agent.interrupts, 1);
   assert.equal(d.state, 'LISTENING');
+
+  f.audioIn.frame();
+  assert.equal(f.transcriber.current!.pushed.length, 0, 'and capture ends with the turn');
+
+  await d.stop();
+});
+
+test('a stop command that races a permission request does not strand it', async () => {
+  const f = makeFakes(config);
+  const d = new Director(f.deps);
+  await d.start();
+  f.turns.speechStart();
+  f.transcriber.final('scrivi il file');
+  f.turns.turnEnd();
+  await f.tick();
+  assert.equal(d.state, 'THINKING');
+
+  f.turns.speechStart();
+  f.transcriber.final('basta');
+  f.turns.turnEnd();
+  // Deliberately no tick: the request lands while #onTurnEnd is suspended in
+  // the round trip that forces the final transcription. That does not bump
+  // #turnId, so the stop branch goes on to run on top of an approval that is
+  // already outstanding.
+  const decision = f.agent.requestPermission({ tool: 'Write', summary: 'scrivere su session.ts' });
+  await f.tick();
+  assert.equal(d.state, 'LISTENING');
+
+  f.advance(config.director.approvalTimeoutMs + 10);
+  await f.tick();
+  assert.equal(await decision, false, 'a cancelled turn denies what it was about to ask');
+  assert.ok(
+    !f.voice.spoken.some((s) => /lascio stare/i.test(s)),
+    'a timer left armed on a dead approval speaks GAVE_UP into an unrelated moment later',
+  );
 
   await d.stop();
 });
