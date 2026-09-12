@@ -174,6 +174,8 @@ export class Director {
     this.#tts?.abort();
     this.#stopFiller();
     this.#resolveApproval(false);
+    // Nothing is coming back to drain this session's queue.
+    this.#queued = [];
 
     const stream = this.#stream;
     this.#stream = undefined;
@@ -236,6 +238,10 @@ export class Director {
     this.#turnId++;
     this.#stopFiller();
     this.#tts?.abort();
+    // A fresh utterance that barges in supersedes the turn it cut off — and
+    // anything that turn had queued from an earlier follow-up. Keeping it
+    // would answer stale words after the turn the user actually asked for.
+    this.#queued = [];
 
     const { heardMs } = await this.#deps.audioOut.flush();
     this.#pendingNote = this.#heardPrefix(heardMs);
@@ -309,9 +315,13 @@ export class Director {
         this.#resolveApproval(false);
         void this.#deps.agent.interrupt();
         this.#state = 'LISTENING';
+        // A stop word cancels the line of thought it interrupted. Anything
+        // still waiting from earlier in that same line must not resurrect once
+        // the next, unrelated turn is done answering.
+        this.#queued = [];
         return;
       }
-      if (said) this.#queued.push(said); // Task 3 drains this into the next turn.
+      if (said) this.#queued.push(said); // Drained at the end of #run.
       return;
     }
 
@@ -389,6 +399,11 @@ export class Director {
     if (this.#turnId !== id) return;
     this.#stopFiller();
     this.#state = 'LISTENING';
+
+    // Said while the answer was in flight. It was deliberately not allowed to
+    // interrupt, so it must not be silently dropped either.
+    const next = this.#queued.shift();
+    if (next !== undefined) this.#ask(next);
   }
 
   async #play(sentences: AsyncIterable<string>, signal: AbortSignal, id: number): Promise<void> {
@@ -500,6 +515,10 @@ export class Director {
         // half-finished answer to arrive at an empty room.
         this.#turnId++;
         this.#tts?.abort();
+        // This #run will never reach the drain at the end of it — it's being
+        // abandoned right here — so anything it had queued would otherwise sit
+        // forgotten until surfacing, unasked-for, after a later turn.
+        this.#queued = [];
         // The agent is still working on the turn nobody is waiting for, and its
         // result would otherwise surface in the middle of the next one.
         void this.#deps.agent.interrupt();
@@ -552,6 +571,9 @@ export class Director {
     this.#tts?.abort();
     this.#stopFiller();
     this.#resolveApproval(false);
+    // The turn that would have drained this is dead, and an apology is about
+    // to be spoken in its place — nothing queued against it belongs after that.
+    this.#queued = [];
     // Dropping the turn locally is not enough: the agent keeps working, and its
     // result lands inside whatever turn comes next and ends it early.
     void this.#deps.agent.interrupt();

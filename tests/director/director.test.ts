@@ -139,6 +139,55 @@ test('speech that outlasts the first sentence is a follow-up, not a dropped turn
   await d.stop();
 });
 
+test('a follow-up said while thinking is answered after the current answer', async () => {
+  const f = makeFakes(config);
+  const d = new Director(f.deps);
+  await d.start();
+  // First token not yet emitted: FakeAgentSession.send() blocks until an event
+  // is pushed, so the Director simply sits in THINKING.
+  f.turns.speechStart();
+  f.transcriber.final('quando gioca il napoli');
+  f.turns.turnEnd();
+  await f.tick();
+
+  f.turns.speechStart();
+  f.transcriber.final('e anche che tempo fa');
+  f.turns.turnEnd();
+  await f.tick();
+
+  f.agent.emitText('Gioca domenica.');
+  await f.tick();
+  f.agent.emitDone();
+  await f.tick();
+
+  assert.deepEqual(f.agent.sent, ['quando gioca il napoli', 'e anche che tempo fa']);
+
+  await d.stop();
+});
+
+test('a hallucinated transcript is never queued', async () => {
+  const f = makeFakes(config);
+  const d = new Director(f.deps);
+  await d.start();
+  f.turns.speechStart();
+  f.transcriber.final('domanda');
+  f.turns.turnEnd();
+  await f.tick();
+
+  f.turns.speechStart();
+  f.transcriber.final('[Musica]');
+  f.turns.turnEnd();
+  await f.tick();
+  f.agent.emitText('Risposta.');
+  await f.tick();
+  f.agent.emitDone();
+  await f.tick();
+
+  assert.deepEqual(f.agent.sent, ['domanda'], 'a cough is not a question');
+
+  await d.stop();
+});
+
 test('a bare stop command while thinking cancels the turn', async () => {
   const f = makeFakes(config);
   const d = new Director(f.deps);
