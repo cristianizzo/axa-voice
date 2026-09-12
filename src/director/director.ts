@@ -281,6 +281,10 @@ export class Director {
   }
 
   async #onTurnEnd(): Promise<void> {
+    // Whether an onset was ever recorded for the utterance ending here, read
+    // before the clear below wipes it. It is what tells a real utterance apart
+    // from a turnEnd with nothing behind it, in a state that no longer says so.
+    const wasCapturing = this.#capturing;
     // The utterance is over whatever it turns out to be, so capture stops here
     // — on every path out of this method, including the ones that route
     // nothing. Cleared up front rather than once a route has been chosen
@@ -325,7 +329,25 @@ export class Director {
       return;
     }
 
-    if (this.#state !== 'HEARING' && this.#state !== 'AWAITING_APPROVAL') return;
+    // LISTENING with an onset behind it is the same follow-up as the branch
+    // above, one beat later: the user began talking while the agent worked and
+    // was still talking when the answer ended, so #run had already returned the
+    // state to LISTENING by the time this fired. The utterance is real either
+    // way — dropping it here is the silence that feels exactly like being
+    // ignored, which is the defect this whole model exists to remove. It is not
+    // routed through the in-flight branch, though: with the answer finished
+    // there is nothing to queue behind and, deliberately, nothing to stop
+    // either. isStopCommand is not consulted on this path — "basta" said into
+    // an idle agent is an ordinary utterance, not a cancellation of a turn that
+    // has already ended.
+    const finishedUnderTheUser = this.#state === 'LISTENING' && wasCapturing;
+    if (
+      !finishedUnderTheUser &&
+      this.#state !== 'HEARING' &&
+      this.#state !== 'AWAITING_APPROVAL'
+    ) {
+      return;
+    }
 
     const id = this.#turnId;
     const text = await this.#takeFinal();

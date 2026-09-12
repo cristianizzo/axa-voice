@@ -165,6 +165,71 @@ test('a follow-up said while thinking is answered after the current answer', asy
   await d.stop();
 });
 
+test('a follow-up that is still being said when the answer ends is still a turn', async () => {
+  const f = makeFakes(config);
+  const d = new Director(f.deps);
+  await d.start();
+  f.turns.speechStart();
+  f.transcriber.final('quando gioca il napoli');
+  f.turns.turnEnd();
+  await f.tick();
+  assert.equal(d.state, 'THINKING');
+
+  // The user starts talking while the agent works — and is still talking when
+  // the whole answer has played out. #run returns the state to LISTENING under
+  // them, so turnEnd arrives in a state that no longer remembers why they were
+  // being recorded.
+  f.turns.speechStart();
+  f.audioIn.frame();
+  f.agent.emitText('Gioca domenica.');
+  f.agent.emitDone();
+  await f.tick();
+  assert.equal(d.state, 'LISTENING', 'the answer finished while they were still mid-sentence');
+
+  f.transcriber.final('e anche che tempo fa');
+  f.turns.turnEnd();
+  await f.tick();
+
+  assert.deepEqual(
+    f.agent.sent,
+    ['quando gioca il napoli', 'e anche che tempo fa'],
+    'a question swallowed because the answer happened to end first is indistinguishable from being ignored',
+  );
+  assert.equal(d.state, 'THINKING', 'and it is an ordinary turn, like any other');
+
+  await d.stop();
+});
+
+test('a stop word arriving after the turn already ended is an ordinary utterance', async () => {
+  const f = makeFakes(config);
+  const d = new Director(f.deps);
+  await d.start();
+  f.turns.speechStart();
+  f.transcriber.final('cerca qualcosa');
+  f.turns.turnEnd();
+  await f.tick();
+
+  f.turns.speechStart();
+  f.audioIn.frame();
+  f.agent.emitText('Ecco qua.');
+  f.agent.emitDone();
+  await f.tick();
+  assert.equal(d.state, 'LISTENING');
+
+  f.transcriber.final('basta');
+  f.turns.turnEnd();
+  await f.tick();
+
+  assert.equal(f.agent.interrupts, 0, 'with nothing in flight there is nothing to stop');
+  assert.deepEqual(
+    f.agent.sent,
+    ['cerca qualcosa', 'basta'],
+    'a stop word cancels a turn that is still running; into an idle agent it is just something the user said',
+  );
+
+  await d.stop();
+});
+
 test('a hallucinated transcript is never queued', async () => {
   const f = makeFakes(config);
   const d = new Director(f.deps);
