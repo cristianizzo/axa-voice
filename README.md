@@ -176,6 +176,8 @@ AXA_LIVE=1 npm test   # real Claude session, real Cartesia, real speakers
 - `tests/audio/helper.test.ts` drives the native helper: it opens the real microphone,
   so it asks first rather than doing it behind a plain `npm test`.
 
+`AXA_DEBUG=1 npm start` prints the turn trace.
+
 ## Docs
 
 - [Design](docs/superpowers/specs/2026-09-11-voice-agent-design.md) — architecture,

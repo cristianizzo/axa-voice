@@ -845,3 +845,83 @@ test('the voice connection is warmed at startup, not on the first turn', async (
   await director.stop();
   assert.equal(f.voice.closes, 1);
 });
+
+// -------------------------------------------------------------- diagnostics
+
+test('diagnostics stay silent unless a debug hook is supplied', async () => {
+  const f = makeFakes(config);
+  const director = new Director(f.deps);
+
+  // No `debug` dep was injected — the Director must never reach for a bare
+  // console call of its own, or this is a log again, not a voice app.
+  const originalLog = console.log;
+  const originalError = console.error;
+  let calls = 0;
+  console.log = () => {
+    calls++;
+  };
+  console.error = () => {
+    calls++;
+  };
+  try {
+    await director.start();
+    f.turns.speechStart();
+    f.transcriber.final('che ore sono');
+    f.turns.turnEnd();
+    await f.tick();
+    f.agent.emitText('Sono le tre.');
+    await f.tick();
+    f.agent.emitDone();
+    await f.tick();
+    await director.stop();
+  } finally {
+    console.log = originalLog;
+    console.error = originalError;
+  }
+
+  assert.equal(calls, 0, 'a quiet default: this is a voice app, not a log');
+});
+
+test('a debug hook receives the turn trace: transcript, state, tool, and the barge-in accounting', async () => {
+  const lines: string[] = [];
+  const f = makeFakes(config, { debug: (message: string) => lines.push(message) });
+  const director = new Director(f.deps);
+  await director.start();
+
+  f.turns.speechStart();
+  f.transcriber.final('cerca il meteo');
+  f.turns.turnEnd();
+  await f.tick();
+  f.agent.emitText('Aspetta, controllo.');
+  await f.tick();
+  f.agent.emitTool('WebSearch', 'start');
+  await f.tick();
+  f.agent.emitTool('WebSearch', 'end');
+  await f.tick();
+  f.agent.emitText('A Valenza ci sono venti gradi.');
+  await f.tick();
+  assert.equal(director.state, 'SPEAKING');
+
+  // The barge-in that Task 7 needs the numbers from.
+  f.turns.speechStart();
+  await f.tick();
+
+  await director.stop();
+
+  assert.ok(
+    lines.includes(`turn: transcript=${JSON.stringify('cerca il meteo')}`),
+    'the turn boundary names what was said',
+  );
+  assert.ok(
+    lines.includes('state: LISTENING -> HEARING'),
+    'state transitions are traced by name, not just the fact that one happened',
+  );
+  assert.ok(lines.includes('tool: start WebSearch'), 'tool names are traced, start...');
+  assert.ok(lines.includes('tool: end WebSearch'), '...and end');
+
+  const bargeIn = lines.find((l) => l.startsWith('barge-in:'));
+  assert.ok(bargeIn, 'the barge-in accounting line exists');
+  for (const field of ['enqueuedMs=', 'answerFromMs=', 'asideMs=', 'heardMs=', 'prefix=']) {
+    assert.ok(bargeIn!.includes(field), `barge-in line is missing ${field}`);
+  }
+});

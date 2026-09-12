@@ -47,6 +47,9 @@ const director = new Director({
   voice,
   filter: new SentenceSpeechFilter(),
   onError: (message) => console.error(`\n[audio] ${message}`),
+  // Off by default: the failure this exists to diagnose was a silent process,
+  // not a noisy one. Set AXA_DEBUG=1 to get the per-turn trace back.
+  debug: process.env.AXA_DEBUG ? console.error : undefined,
 });
 
 let shuttingDown = false;

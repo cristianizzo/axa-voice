@@ -47,6 +47,12 @@ export interface DirectorDeps {
   timers?: Timers;
   /** Where technical detail goes. The user hears a short line instead. */
   onError?: (message: string) => void;
+  /**
+   * Where the per-turn trace goes. Left undefined by default: this is a voice
+   * app, not a log, and the failure this exists to prevent was a silent one,
+   * not a noisy one. `cli.ts` wires it to `console.error` behind `AXA_DEBUG`.
+   */
+  debug?: (message: string) => void;
 }
 
 const systemTimers: Timers = {
@@ -186,6 +192,22 @@ export class Director {
     return this.#state;
   }
 
+  /** No-op unless a `debug` dep was injected — never a bare `console.log` here. */
+  #debug(message: string): void {
+    this.#deps.debug?.(message);
+  }
+
+  /**
+   * The single place `#state` changes, so the single place a transition can be
+   * traced. A no-op transition (`approval.from` landing back on the state it
+   * started from) is not worth a line — it tells Task 7 nothing it did not
+   * already know.
+   */
+  #setState(next: DirectorState): void {
+    if (next !== this.#state) this.#debug(`state: ${this.#state} -> ${next}`);
+    this.#state = next;
+  }
+
   async start(): Promise<void> {
     const { audioIn, turns, agent, voice } = this.#deps;
 
@@ -200,7 +222,7 @@ export class Director {
 
     await this.#openStream();
     await audioIn.start();
-    this.#state = 'LISTENING';
+    this.#setState('LISTENING');
   }
 
   async stop(): Promise<void> {
@@ -218,7 +240,7 @@ export class Director {
     await stream?.close();
     await this.#deps.audioIn.stop();
     this.#deps.voice.close?.();
-    this.#state = 'LISTENING';
+    this.#setState('LISTENING');
   }
 
   // ---------------------------------------------------------------- listening
@@ -266,7 +288,7 @@ export class Director {
     if (this.#state === 'THINKING') return;
 
     const wasSpeaking = this.#state === 'SPEAKING';
-    this.#state = 'HEARING';
+    this.#setState('HEARING');
     if (wasSpeaking) void this.#bargeIn();
   }
 
@@ -282,6 +304,12 @@ export class Director {
 
     const { heardMs } = await this.#deps.audioOut.flush();
     this.#pendingNote = this.#heardPrefix(heardMs);
+    // The other turn boundary, and the one Task 7 exists for: every number
+    // §5's hypothesis is about, read at the exact moment they are compared.
+    this.#debug(
+      `barge-in: enqueuedMs=${this.#enqueuedMs} answerFromMs=${this.#answerFromMs} ` +
+        `asideMs=${this.#asideMs} heardMs=${heardMs} prefix=${JSON.stringify(this.#pendingNote)}`,
+    );
 
     // interrupt(), not abort(): aborting tears the session down and costs ~2s.
     await this.#deps.agent.interrupt();
@@ -366,7 +394,7 @@ export class Director {
         // GAVE_UP into a moment that has nothing to do with it.
         this.#resolveApproval(false);
         void this.#deps.agent.interrupt();
-        this.#state = 'LISTENING';
+        this.#setState('LISTENING');
         // A stop word cancels the line of thought it interrupted. Anything
         // still waiting from earlier in that same line must not resurrect once
         // the next, unrelated turn is done answering.
@@ -411,7 +439,7 @@ export class Director {
     }
     if (!text) {
       // A cough that whisper turned into "[Musica]" is not a turn.
-      this.#state = 'LISTENING';
+      this.#setState('LISTENING');
       return;
     }
     this.#ask(text);
@@ -434,7 +462,10 @@ export class Director {
     this.#pendingNote = undefined;
     if (note !== undefined) this.#deps.agent.notifyInterruption(note, text);
 
-    this.#state = 'THINKING';
+    // The turn boundary Task 7 starts reading from: without the transcript
+    // here, a barge-in's numbers further down have nothing to be numbers about.
+    this.#debug(`turn: transcript=${JSON.stringify(text)}`);
+    this.#setState('THINKING');
     this.#startFiller();
     void this.#run(text);
   }
@@ -460,6 +491,7 @@ export class Director {
       for await (const event of director.#deps.agent.send(text)) {
         if (director.#turnId !== id) return;
         if (event.type === 'tool') {
+          director.#debug(`tool: ${event.phase} ${event.name}`);
           if (event.phase === 'start') {
             // Only the first of a group of parallel calls arms the timer; a
             // second, third, ... call arriving while one is already running
@@ -501,7 +533,7 @@ export class Director {
     // A stream that ends inside a tool bracket — an interrupt, a crashed tool —
     // leaves the timer armed with nothing left to narrate.
     this.#stopProgress();
-    this.#state = 'LISTENING';
+    this.#setState('LISTENING');
 
     // Said while the answer was in flight. It was deliberately not allowed to
     // interrupt, so it must not be silently dropped either.
@@ -681,12 +713,12 @@ export class Director {
         // The agent is still working on the turn nobody is waiting for, and its
         // result would otherwise surface in the middle of the next one.
         void this.#deps.agent.interrupt();
-        this.#state = 'LISTENING';
+        this.#setState('LISTENING');
         void this.#say(GAVE_UP);
       }, this.#deps.config.director.approvalTimeoutMs);
 
       this.#approval = { resolve, from, timer };
-      this.#state = 'AWAITING_APPROVAL';
+      this.#setState('AWAITING_APPROVAL');
       void this.#say(`Posso ${req.summary}?`);
     });
   }
@@ -701,11 +733,11 @@ export class Director {
     // 'unclear' is a denial AND a new turn. Denying without re-dispatching
     // loses what the user said, which feels exactly like being ignored (§8).
     if (verdict === 'unclear' && text) {
-      this.#state = 'HEARING';
+      this.#setState('HEARING');
       void this.#redispatch(text);
       return;
     }
-    this.#state = approval.from;
+    this.#setState(approval.from);
   }
 
   async #redispatch(text: string): Promise<void> {
@@ -737,7 +769,7 @@ export class Director {
     // Dropping the turn locally is not enough: the agent keeps working, and its
     // result lands inside whatever turn comes next and ends it early.
     void this.#deps.agent.interrupt();
-    this.#state = 'LISTENING';
+    this.#setState('LISTENING');
     void this.#say(line);
   }
 }
