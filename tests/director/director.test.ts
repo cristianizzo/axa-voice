@@ -309,6 +309,38 @@ test('a stop command that races a permission request does not strand it', async 
   await d.stop();
 });
 
+test('a stop word said while thinking cancels even after a permission prompt lands', async () => {
+  const f = makeFakes(config);
+  const d = new Director(f.deps);
+  await d.start();
+  f.turns.speechStart();
+  f.transcriber.final('scrivi il file');
+  f.turns.turnEnd();
+  await f.tick();
+  assert.equal(d.state, 'THINKING');
+
+  // The user starts a follow-up while the agent works...
+  f.turns.speechStart();
+  f.audioIn.frame();
+
+  // ...and, still mid-sentence, the agent reaches a tool needing permission:
+  // the Director asks out loud and the state moves to AWAITING_APPROVAL.
+  const decision = f.agent.requestPermission({ tool: 'Write', summary: 'scrivere su session.ts' });
+  await f.tick();
+  assert.equal(d.state, 'AWAITING_APPROVAL');
+
+  f.transcriber.final('basta');
+  f.turns.turnEnd();
+  await f.tick();
+
+  assert.equal(f.agent.interrupts, 1, 'basta cancels the turn, not just the permission');
+  assert.equal(d.state, 'LISTENING');
+  assert.equal(await decision, false, 'the outstanding approval is resolved, not stranded');
+  assert.deepEqual(f.agent.sent, ['scrivi il file'], 'basta is not re-dispatched as a new turn');
+
+  await d.stop();
+});
+
 test('barge-in flushes, interrupts, and reports what was actually heard', async () => {
   const f = makeFakes(config);
   const director = new Director(f.deps);

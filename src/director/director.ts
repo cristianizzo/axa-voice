@@ -120,6 +120,15 @@ export class Director {
    * exactly what let a follow-up during THINKING look like a cancellation.
    */
   #capturing = false;
+  /**
+   * The state when the utterance now being recorded began, or null when nothing
+   * is being recorded. `#onTurnEnd` routes by this, not by the state the
+   * machine has since moved to: a follow-up that began in THINKING can land in
+   * AWAITING_APPROVAL if a permission prompt arrived mid-sentence, and only
+   * where capture BEGAN says whether it is a follow-up or the answer to that
+   * prompt.
+   */
+  #capturingFrom: DirectorState | null = null;
   /** What the user said while THINKING, waiting to be folded into the next turn. */
   #queued: string[] = [];
 
@@ -287,6 +296,10 @@ export class Director {
 
   #onSpeechStart(): void {
     this.#capturing = true;
+    // Record where the utterance began before any transition below moves it:
+    // the routing at #onTurnEnd has to know whether this was a follow-up (from
+    // THINKING), a barge-in (from SPEAKING), or an approval answer.
+    this.#capturingFrom = this.#state;
     // Already listening: HEARING is mid-utterance, AWAITING_APPROVAL is waiting
     // for an answer. Neither is interrupted by the user starting to talk.
     if (this.#state === 'HEARING' || this.#state === 'AWAITING_APPROVAL') return;
@@ -390,6 +403,7 @@ export class Director {
     // before the clear below wipes it. It is what tells a real utterance apart
     // from a turnEnd with nothing behind it, in a state that no longer says so.
     const wasCapturing = this.#capturing;
+    const capturingFrom = this.#capturingFrom;
     // The utterance is over whatever it turns out to be, so capture stops here
     // — on every path out of this method, including the ones that route
     // nothing. Cleared up front rather than once a route has been chosen
@@ -397,17 +411,23 @@ export class Director {
     // await is what would feed whisper for the rest of the answer, and setting
     // it after would clobber a fresh onset that arrived inside the await.
     this.#capturing = false;
+    this.#capturingFrom = null;
 
-    // A turn still in flight. THINKING is the obvious case; SPEAKING is reached
-    // when speech that began while the agent was working outlasts the answer's
-    // first sentence, because #run flips the state the moment that sentence
-    // exists. Under an ordinary barge-in the state is already HEARING by the
-    // time a transcript exists, so this branch only ever sees capture that
-    // began while the agent was working — a follow-up, routed as one. §1's
-    // table omits SPEAKING only because it assumed barge-in had already moved
-    // the state to HEARING; that does not hold for capture that started
-    // earlier, and dropping the utterance here is how it gets lost.
-    if (this.#state === 'THINKING' || this.#state === 'SPEAKING') {
+    // A follow-up: capture that began while the agent was working (THINKING).
+    // Where the state has since moved to does not change what the user meant —
+    // the two earlier fixes already cover THINKING -> SPEAKING (the first
+    // sentence landed) and THINKING -> LISTENING (the answer finished, handled
+    // below). This adds THINKING -> AWAITING_APPROVAL, where a permission
+    // prompt arrived mid-sentence and the state now reads as if the utterance
+    // were the prompt's answer. While the turn is still in flight it is a
+    // stop-or-queue; LISTENING is deliberately not this branch, since there is
+    // then nothing to queue behind and nothing to stop.
+    const beganWhileWorking = capturingFrom === 'THINKING';
+    const stillInFlight =
+      this.#state === 'THINKING' ||
+      this.#state === 'SPEAKING' ||
+      this.#state === 'AWAITING_APPROVAL';
+    if (beganWhileWorking && stillInFlight) {
       const id = this.#turnId;
       const said = await this.#takeFinal();
       // Forcing the final transcription is a round trip; a barge-in, an audio
