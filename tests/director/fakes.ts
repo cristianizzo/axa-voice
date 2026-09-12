@@ -336,7 +336,15 @@ class FakeVoice implements Voice {
   }
 }
 
-export function makeFakes(config: Config) {
+/**
+ * Extra Director deps a test can inject on top of the fakes below — the
+ * `debug` hook, so far — without a second fake factory. `Partial<DirectorDeps>`
+ * rather than a bespoke type: it stays exact as `DirectorDeps` grows, with
+ * nothing here to fall out of date.
+ */
+export type FakeOverrides = Partial<DirectorDeps>;
+
+export function makeFakes(config: Config, overrides: FakeOverrides = {}) {
   const audioIn = new FakeAudioInput();
   const audioOut = new FakeAudioOutput(config);
   const transcriber = new FakeTranscriber();
@@ -359,6 +367,7 @@ export function makeFakes(config: Config) {
     filter: new SentenceSpeechFilter(),
     timers,
     onError: (message) => errors.push(message),
+    ...overrides,
   };
 
   return {
