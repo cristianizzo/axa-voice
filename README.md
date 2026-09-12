@@ -25,6 +25,8 @@ axa-voice targets exactly those three:
 | Time to first sound | ~2s | ~1.3s (measured, not estimated) |
 | Interrupt mid-answer | no | yes, silent within 50ms |
 | Knows where it got cut off | — | yes, it resumes from what you actually heard |
+| Talk while it is working | — | adds to the conversation instead of cancelling it; answered next |
+| During a long search | silence | says what it is doing, every few seconds |
 | Reads code aloud | — | never; code stays on screen |
 
 ## How it works
@@ -156,7 +158,7 @@ counts as a no.
 ## Tests
 
 ```sh
-npm test            # 139 unit tests, no hardware, no network, no money
+npm test            # 165 unit tests, no hardware, no network, no money
 npm run typecheck
 ```
 

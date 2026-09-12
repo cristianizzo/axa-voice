@@ -458,6 +458,24 @@ telling Claude it was cut off later than it was is exactly the error §6 exists 
 drain those before returning to `LISTENING`, or the agent resumes speaking about the
 thing the user just interrupted.
 
+### Barge-in is scoped to `SPEAKING`
+
+The sequence above applies **only** while the Director is `SPEAKING`. Speech during
+`THINKING` is not an interruption: it is captured, and the transcript is routed by state
+when the turn ends. Capture is therefore independent of `#state` — `THINKING` stays
+`THINKING` while the user is being recorded, and the state machine gains no fifth state.
+
+- A **bare stop command** — `basta`, `stop`, `lascia stare`, `lascia perdere`, `annulla`,
+  `annullalo`, `ferma`, `fermati`, `fermo`, but deliberately **not** `aspetta` — cancels
+  the turn via `interrupt()`. It is a whole-utterance match only, so the same word inside
+  a longer sentence (`"non dirmi basta"`) stops nothing.
+- **Anything else** is queued and answered once the current answer completes, as if
+  freshly spoken. Talking while it works adds to the conversation instead of destroying
+  the work — the opposite of the behaviour that motivated this amendment.
+
+The waiting model as a whole is specified in
+[2026-09-12-interruption-model-design.md](2026-09-12-interruption-model-design.md).
+
 ### Telling Claude it was cut off
 
 Step 4 exists because of step 5's consequence. After the user's new turn is
