@@ -7,8 +7,13 @@ import { encodeCommand, EventParser, PcmParser } from '../../src/audio/protocol.
 const helper = new URL('../../native/aecio', import.meta.url).pathname;
 // Needs a real audio device and a microphone grant, so it opts out rather than
 // hanging or failing mysteriously where neither exists (CI, ssh, no hardware).
+// Opt-in like the other hardware tests: a plain `npm test` promises no hardware,
+// and a suite that silently opens the microphone breaks that promise.
 const hasDevice =
-  process.platform === 'darwin' && existsSync(helper) && !process.env.AXA_NO_AUDIO_HW;
+  process.platform === 'darwin' &&
+  existsSync(helper) &&
+  !process.env.AXA_NO_AUDIO_HW &&
+  Boolean(process.env.AXA_LIVE);
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 

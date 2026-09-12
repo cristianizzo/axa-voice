@@ -90,6 +90,11 @@ class Recorder implements AudioOutput {
     return false;
   }
 
+  /** Never full: the recorder is measuring latency, not pacing playback. */
+  bufferedMs(): number {
+    return 0;
+  }
+
   reset(): void {
     this.firstFrameAt = undefined;
     this.frames = 0;

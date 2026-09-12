@@ -173,3 +173,57 @@ test('enqueue writes a framed A command carrying the samples little-endian', asy
   assert.equal(out.readInt16LE(5), -12345);
   assert.equal(out.readInt16LE(7), 12345);
 });
+
+test('a playback overflow is reported instead of truncating the answer in silence', async () => {
+  const proc = fakeHelper();
+  const device = new AudioDevice(config, { spawnFn: (() => proc) as never });
+  const started = device.start();
+  proc.stderr.write('{"type":"ready","rate":24000,"micRate":16000}\n');
+  await started;
+
+  const errors: string[] = [];
+  device.onError((m) => errors.push(m));
+  proc.stderr.write('{"type":"overflow","dropped":480}\n');
+  await sleep(10);
+
+  assert.equal(errors.length, 1, 'dropped playback is the one failure with no other symptom');
+  assert.match(errors[0]!, /truncated/);
+});
+
+test('a microphone delivering only digital silence is reported, not waited on', async () => {
+  const proc = fakeHelper();
+  const device = new AudioDevice(config, { spawnFn: (() => proc) as never });
+  const started = device.start();
+  proc.stderr.write('{"type":"ready","rate":24000,"micRate":16000}\n');
+  await started;
+
+  const errors: string[] = [];
+  device.onError((m) => errors.push(m));
+
+  // Six seconds of exactly-zero samples. A live microphone never produces them:
+  // even a quiet room carries a noise floor.
+  proc.stdout.write(Buffer.alloc(config.audio.frameRate * 2 * 6));
+  await sleep(20);
+
+  assert.equal(errors.length, 1, 'said once, not once per 20ms frame');
+  assert.match(errors[0]!, /silence/);
+});
+
+test('a quiet moment during playback is not mistaken for a dead microphone', async () => {
+  const proc = fakeHelper();
+  const device = new AudioDevice(config, { spawnFn: (() => proc) as never });
+  const started = device.start();
+  proc.stderr.write('{"type":"ready","rate":24000,"micRate":16000}\n');
+  await started;
+
+  const errors: string[] = [];
+  device.onError((m) => errors.push(m));
+
+  // Echo cancellation is entitled to gate the microphone to nothing while the
+  // agent is talking, which is most of the time it is worth listening at all.
+  device.enqueue(new Int16Array(config.audio.deviceRate * 10));
+  proc.stdout.write(Buffer.alloc(config.audio.frameRate * 2 * 6));
+  await sleep(20);
+
+  assert.deepEqual(errors, [], 'the agent must not apologise for its own echo cancellation');
+});

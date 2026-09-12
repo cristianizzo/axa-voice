@@ -32,6 +32,14 @@ export function encodeWav(samples: Int16Array, rate: number): Buffer<ArrayBuffer
   return buffer;
 }
 
+/**
+ * Caps on a server that stops answering. Both exist because the Director awaits
+ * close() before it can reply and shutdown awaits it too: an unbounded wait here
+ * is not a slow transcript, it is a session that never speaks again.
+ */
+const REQUEST_TIMEOUT_MS = 10_000;
+const CLOSE_WAIT_MS = 2_000;
+
 export class WhisperTranscriber implements Transcriber {
   readonly #config: Config;
   readonly #fetchFn: typeof fetch;
@@ -85,8 +93,10 @@ class WhisperStream implements TranscriptionStream {
     this.#closed = true;
     clearInterval(this.#timer);
     // Wait out an in-flight partial: the server serializes, so racing it would
-    // only make the final transcript slower (spec §5).
-    while (this.#busy) await new Promise((r) => setTimeout(r, 10));
+    // only make the final transcript slower (spec §5). Bounded, because a
+    // partial that never comes back must not take the turn down with it.
+    const until = Date.now() + CLOSE_WAIT_MS;
+    while (this.#busy && Date.now() < until) await new Promise((r) => setTimeout(r, 10));
     const text = await this.#transcribe(0);
     if (text) for (const handler of this.#finalHandlers) handler(text);
   }
@@ -115,6 +125,9 @@ class WhisperStream implements TranscriptionStream {
       const res = await this.#fetchFn(`http://127.0.0.1:${port}/inference`, {
         method: 'POST',
         body: form,
+        // Without a deadline a hung request leaves #busy set for ever, and every
+        // later tick and close() then waits on a partial that will never land.
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
       if (!res.ok) return '';
       return clean(await res.text());

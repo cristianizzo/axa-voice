@@ -294,7 +294,11 @@ test('a dead spare is discarded rather than used', async () => {
     }
   })();
   await tick(10);
-  const fresh = sockets.at(-1)!;
+  // One dead, one opened for this turn, one prewarmed for the next. The third
+  // is the point: without it a single dropped spare makes every later turn pay
+  // the 458-500ms handshake again, silently.
+  assert.equal(sockets.length, 3, 'a fresh spare must replace the dead one');
+  const fresh = sockets[1]!;
   fresh.open();
   await tick(10);
   assert.ok(fresh.sent.length > 0, 'the turn used a fresh connection');

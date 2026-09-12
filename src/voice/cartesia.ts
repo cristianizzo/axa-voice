@@ -74,13 +74,15 @@ export class CartesiaVoice implements Voice {
   /** The spare if it is still usable, otherwise a fresh connection. */
   #takeSocket(): WebSocket {
     const spare = this.#spare;
-    if (spare && (spare.readyState === OPEN || spare.readyState === CONNECTING)) {
-      this.#spare = undefined;
-      // Start the next handshake now, so it overlaps this turn's audio.
-      this.prewarm();
-      return spare;
-    }
-    return this.#connect(this.#url());
+    // Cleared before the usability test, not after it: a spare that died in the
+    // meantime has to leave the field too, or prewarm() below sees it, decides a
+    // spare already exists, and every later turn pays the 458-500ms handshake.
+    this.#spare = undefined;
+    const usable = spare && (spare.readyState === OPEN || spare.readyState === CONNECTING);
+    const socket = usable ? spare : this.#connect(this.#url());
+    // Start the next handshake now, so it overlaps this turn's audio.
+    this.prewarm();
+    return socket;
   }
 
   async *synthesize(text: AsyncIterable<string>, signal: AbortSignal): AsyncIterable<AudioFrame> {

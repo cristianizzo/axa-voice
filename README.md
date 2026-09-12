@@ -156,11 +156,11 @@ counts as a no.
 ## Tests
 
 ```sh
-npm test            # 134 unit tests, no hardware, no network, no money
+npm test            # 139 unit tests, no hardware, no network, no money
 npm run typecheck
 ```
 
-Three tests are skipped by default because they touch the real world:
+Four tests are skipped by default because they touch the real world:
 
 ```sh
 AXA_LIVE=1 npm test   # real Claude session, real Cartesia, real speakers
@@ -173,6 +173,8 @@ AXA_LIVE=1 npm test   # real Claude session, real Cartesia, real speakers
 - `tests/integration/echo.test.ts` plays 3s of speech out of the speakers with the
   microphone open and asserts the transcript is empty. **Do not run it with headphones on**
   — headphones hide exactly the bug it exists to catch.
+- `tests/audio/helper.test.ts` drives the native helper: it opens the real microphone,
+  so it asks first rather than doing it behind a plain `npm test`.
 
 ## Docs
 

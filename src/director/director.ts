@@ -67,6 +67,17 @@ const GAVE_UP = 'Va bene, lascio stare. Non ho sentito la risposta.';
 const AUDIO_TROUBLE = 'Ho un problema con l’audio, controlla il microfono.';
 const TURN_FAILED = 'Scusa, qualcosa è andato storto. Riprova.';
 
+/**
+ * How far ahead of the speakers the answer is allowed to run.
+ *
+ * The device queue holds four seconds; TTS delivers a long answer far faster
+ * than it can be spoken, so without a ceiling the queue overflows and the tail
+ * of the answer is dropped mid-word. Half the queue leaves room for the jitter
+ * of a network voice while keeping a barge-in's flush cheap.
+ */
+const PLAYBACK_HIGH_WATER_MS = 2000;
+const PLAYBACK_POLL_MS = 50;
+
 async function only(text: string): Promise<AsyncIterable<string>> {
   return (async function* () {
     yield text;
@@ -97,12 +108,22 @@ export class Director {
    */
   #turnId = 0;
   #tts: AbortController | undefined;
+  /** The line the Director itself is speaking, if any. One at a time. */
+  #line: AbortController | undefined;
   #fillerTimer: unknown;
   #fillerIndex = 0;
 
-  /** Sentences handed to the voice this turn, and the audio they produced. */
+  /** Sentences handed to the voice this turn. */
   #spoken: string[] = [];
-  #spokenMs = 0;
+
+  /**
+   * Total audio ever handed to the speakers, counted the way the device counts
+   * it: from the beginning, never reset. `flush()` answers in that same
+   * timeline, so the two are only comparable if this one also never restarts.
+   */
+  #enqueuedMs = 0;
+  /** Where in that timeline this turn's answer began. */
+  #answerFromMs = 0;
 
   /** What the user heard before cutting in, waiting for what they say next. */
   #pendingNote: string | undefined;
@@ -141,7 +162,7 @@ export class Director {
     for (const off of this.#unsubscribe.splice(0)) off();
     this.#turnId++;
     this.#tts?.abort();
-    this.#clearFiller();
+    this.#stopFiller();
     this.#resolveApproval(false);
 
     const stream = this.#stream;
@@ -194,7 +215,7 @@ export class Director {
 
   async #bargeIn(): Promise<void> {
     this.#turnId++;
-    this.#clearFiller();
+    this.#stopFiller();
     this.#tts?.abort();
 
     const { heardMs } = await this.#deps.audioOut.flush();
@@ -207,18 +228,29 @@ export class Director {
   /**
    * Map playback milliseconds back onto the text that produced them.
    *
-   * `Voice` hands back one flat frame stream for the whole turn, so there is no
-   * exact sentence-to-audio boundary to read. Proportion by character count is
-   * the honest approximation: monotonic, and it errs towards telling Claude the
-   * user heard LESS than they did, which is the safe direction — repeating a
-   * sentence is a small annoyance, assuming one was heard is a wrong answer.
+   * `heardMs` is cumulative for the life of the device, not for this turn, so
+   * the turn's own audio has to be located inside that timeline first — hence
+   * `#answerFromMs`. Comparing it against a per-turn total instead would make
+   * every barge-in after the first look complete, and the note would then tell
+   * Claude the user heard an answer they cut off after two words, which is the
+   * exact failure §6 exists to prevent.
+   *
+   * Within the turn, `Voice` hands back one flat frame stream, so there is no
+   * sentence-to-audio boundary to read and proportion by character count is the
+   * honest approximation. It is clamped at both ends: audio that never left the
+   * queue cannot have been heard, and audio enqueued before the answer began —
+   * a filler, an approval question — is not part of the answer.
    */
   #heardPrefix(heardMs: number): string {
     const text = this.#spoken.join(' ');
-    if (!text || this.#spokenMs <= 0) return '';
-    if (heardMs >= this.#spokenMs) return text;
+    const answerMs = this.#enqueuedMs - this.#answerFromMs;
+    if (!text || answerMs <= 0) return '';
 
-    const chars = Math.floor(text.length * (heardMs / this.#spokenMs));
+    const heardOfAnswer = Math.min(heardMs - this.#answerFromMs, answerMs);
+    if (heardOfAnswer <= 0) return '';
+    if (heardOfAnswer >= answerMs) return text;
+
+    const chars = Math.floor(text.length * (heardOfAnswer / answerMs));
     const boundary = text.lastIndexOf(' ', chars);
     return text.slice(0, boundary > 0 ? boundary : chars).trim();
   }
@@ -226,7 +258,14 @@ export class Director {
   async #onTurnEnd(): Promise<void> {
     if (this.#state !== 'HEARING' && this.#state !== 'AWAITING_APPROVAL') return;
 
+    const id = this.#turnId;
     const text = await this.#takeFinal();
+    // Forcing the final transcription is a round trip, and an approval timeout,
+    // an audio failure or stop() can all land inside it. Acting on the result
+    // afterwards would answer a question that no longer exists, or start a turn
+    // out of a state that has already moved on.
+    if (this.#turnId !== id) return;
+
     if (this.#state === 'AWAITING_APPROVAL') {
       this.#answer(text);
       return;
@@ -266,13 +305,15 @@ export class Director {
     const tts = new AbortController();
     this.#tts = tts;
     this.#spoken = [];
-    this.#spokenMs = 0;
+    // Provisional: #play moves it to where the answer's first frame actually
+    // lands, so a filler played in between is not counted as answer.
+    this.#answerFromMs = this.#enqueuedMs;
 
     const director = this;
     const sentences = (async function* () {
       for await (const sentence of director.#deps.filter.filter(director.#deps.agent.send(text))) {
         if (director.#turnId !== id) return;
-        director.#clearFiller();
+        director.#stopFiller();
         director.#spoken.push(sentence);
         if (director.#state === 'THINKING') director.#state = 'SPEAKING';
         yield sentence;
@@ -287,7 +328,7 @@ export class Director {
     }
 
     if (this.#turnId !== id) return;
-    this.#clearFiller();
+    this.#stopFiller();
     this.#state = 'LISTENING';
   }
 
@@ -299,52 +340,89 @@ export class Director {
       if (signal.aborted || this.#turnId !== id) break;
       if (!started) {
         started = true;
+        this.#answerFromMs = this.#enqueuedMs;
         for (const sink of sinks) sink.onSpeechStart();
       }
-      this.#spokenMs += (frame.length / this.#deps.config.audio.deviceRate) * 1000;
-      this.#deps.audioOut.enqueue(frame);
-      for (const sink of sinks) sink.onAudio(frame);
+      await this.#waitForRoom(signal, id);
+      if (signal.aborted || this.#turnId !== id) break;
+      this.#emit(frame, sinks);
     }
 
     if (started) for (const sink of sinks) sink.onSpeechEnd();
   }
 
+  /**
+   * Hold the answer back while the speakers catch up. The queue is finite and
+   * the voice is much faster than speech, so without this a long answer is
+   * accepted, dropped by the device, and never heard — the one failure mode
+   * that produces no error anywhere unless the device reports the overflow.
+   */
+  async #waitForRoom(signal: AbortSignal, id: number): Promise<void> {
+    while (
+      this.#deps.audioOut.bufferedMs() > PLAYBACK_HIGH_WATER_MS &&
+      !signal.aborted &&
+      this.#turnId === id
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, PLAYBACK_POLL_MS));
+    }
+  }
+
+  /** The one place audio reaches the speakers, so the one place it is counted. */
+  #emit(frame: AudioFrame, sinks: OutputSink[]): void {
+    this.#enqueuedMs += (frame.length / this.#deps.config.audio.deviceRate) * 1000;
+    this.#deps.audioOut.enqueue(frame);
+    for (const sink of sinks) sink.onAudio(frame);
+  }
+
   /** Speak one line the Director wrote itself: a filler, a question, an apology. */
-  async #say(line: string, signal?: AbortSignal): Promise<void> {
+  async #say(line: string): Promise<void> {
     const sinks = this.#deps.sinks ?? [];
-    const controller = signal ? undefined : new AbortController();
+    // One at a time. Two of these overlapping — a filler running into an
+    // approval question, or two questions back to back — is not a degraded
+    // answer, it is an unintelligible one.
+    this.#line?.abort();
+    const controller = new AbortController();
+    this.#line = controller;
+
     try {
       const source = await only(toSpokenForm(line));
-      for await (const frame of this.#deps.voice.synthesize(
-        source,
-        signal ?? controller!.signal,
-      )) {
-        this.#deps.audioOut.enqueue(frame);
-        for (const sink of sinks) sink.onAudio(frame);
+      for await (const frame of this.#deps.voice.synthesize(source, controller.signal)) {
+        if (controller.signal.aborted) break;
+        this.#emit(frame, sinks);
       }
     } catch (error) {
       // A filler that fails is not worth killing the turn for, but it is worth
       // saying out loud in the log — a voice that silently stops speaking is
       // indistinguishable from one that has nothing to say.
       this.#deps.onError?.(`voice: ${String(error)}`);
+    } finally {
+      if (this.#line === controller) this.#line = undefined;
     }
   }
 
   #startFiller(): void {
-    this.#clearFiller();
+    this.#stopFiller();
     this.#fillerTimer = this.#timers.setTimeout(() => {
       this.#fillerTimer = undefined;
       // The first token may have landed while the timer was queued. Speaking
       // now would be the agent talking over its own answer.
       if (this.#state !== 'THINKING') return;
-      void this.#say(FILLERS[this.#fillerIndex++ % FILLERS.length]!, this.#tts?.signal);
+      void this.#say(FILLERS[this.#fillerIndex++ % FILLERS.length]!);
     }, this.#deps.config.director.fillerAfterMs);
   }
 
-  #clearFiller(): void {
-    if (this.#fillerTimer === undefined) return;
-    this.#timers.clearTimeout(this.#fillerTimer);
-    this.#fillerTimer = undefined;
+  /**
+   * Stop the filler whether it is still pending or already out loud. Cancelling
+   * only the timer leaves a filler that started a moment earlier talking over
+   * the answer it was covering for.
+   */
+  #stopFiller(): void {
+    if (this.#fillerTimer !== undefined) {
+      this.#timers.clearTimeout(this.#fillerTimer);
+      this.#fillerTimer = undefined;
+    }
+    this.#line?.abort();
+    this.#line = undefined;
   }
 
   // ----------------------------------------------------------------- approval
@@ -354,7 +432,7 @@ export class Director {
     // were already thinking about.
     const from = this.#state === 'AWAITING_APPROVAL' ? 'THINKING' : this.#state;
     this.#resolveApproval(false);
-    this.#clearFiller();
+    this.#stopFiller();
 
     return new Promise<boolean>((resolve) => {
       const timer = this.#timers.setTimeout(() => {
@@ -363,6 +441,9 @@ export class Director {
         // half-finished answer to arrive at an empty room.
         this.#turnId++;
         this.#tts?.abort();
+        // The agent is still working on the turn nobody is waiting for, and its
+        // result would otherwise surface in the middle of the next one.
+        void this.#deps.agent.interrupt();
         this.#state = 'LISTENING';
         void this.#say(GAVE_UP);
       }, this.#deps.config.director.approvalTimeoutMs);
@@ -410,8 +491,11 @@ export class Director {
     this.#deps.onError?.(message);
     this.#turnId++;
     this.#tts?.abort();
-    this.#clearFiller();
+    this.#stopFiller();
     this.#resolveApproval(false);
+    // Dropping the turn locally is not enough: the agent keeps working, and its
+    // result lands inside whatever turn comes next and ends it early.
+    void this.#deps.agent.interrupt();
     this.#state = 'LISTENING';
     void this.#say(line);
   }

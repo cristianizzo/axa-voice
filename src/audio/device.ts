@@ -12,6 +12,18 @@ const READY_TIMEOUT_MS = 5000;
 const STOP_GRACE_MS = 500;
 
 /**
+ * A capture path that dies does not report an error, it reports perfect digital
+ * silence — which is indistinguishable from a quiet room to everything above,
+ * and leaves the app waiting for a turn that can never come (spec §9).
+ *
+ * A live microphone always carries a noise floor, so exactly-zero samples for
+ * this long mean the device stopped rather than that nobody is talking. The
+ * check is suspended during playback, where echo cancellation is entitled to
+ * gate the microphone down to nothing.
+ */
+const DEAD_MIC_MS = 5000;
+
+/**
  * Capture, playback and echo cancellation. One class implements both `AudioInput`
  * and `AudioOutput` because underneath there is one `AUVoiceProcessor`: bus 1 is
  * the microphone, bus 0 is the speaker, and AEC needs the playback signal as its
@@ -33,6 +45,8 @@ export class AudioDevice implements AudioInput, AudioOutput {
   #flushSeq = 0;
   /** Wall clock at which the audio handed to the helper will have finished. */
   #playingUntil = 0;
+  #silentMs = 0;
+  #deadMicReported = false;
 
   constructor(config: Config, opts: { spawnFn?: typeof spawn } = {}) {
     this.#config = config;
@@ -48,9 +62,13 @@ export class AudioDevice implements AudioInput, AudioOutput {
     );
     this.#proc = proc;
 
+    this.#silentMs = 0;
+    this.#deadMicReported = false;
+
     const pcm = new PcmParser(frameSamples);
     proc.stdout!.on('data', (chunk: Buffer) => {
       for (const frame of pcm.push(chunk)) {
+        this.#watchForDeadMic(frame);
         for (const handler of this.#frameHandlers) handler(frame);
       }
     });
@@ -85,6 +103,14 @@ export class AudioDevice implements AudioInput, AudioOutput {
               break;
             case 'flushed':
               this.#resolveFlushes(event.seq, event.heardMs);
+              break;
+            case 'overflow':
+              // The helper's 4s playback ring filled and it threw samples away.
+              // The answer is being cut mid-word, and the dropped frames were
+              // already counted as spoken, so the heard-prefix mapping goes
+              // wrong too. Callers watch bufferedMs() to prevent this; reaching
+              // here means that failed, and silence would hide it (spec §9).
+              this.#fail('audio helper dropped playback samples: the answer was truncated');
               break;
             case 'error':
               this.#fail(event.message);
@@ -151,7 +177,11 @@ export class AudioDevice implements AudioInput, AudioOutput {
   }
 
   isPlaying(): boolean {
-    return Date.now() < this.#playingUntil;
+    return this.bufferedMs() > 0;
+  }
+
+  bufferedMs(): number {
+    return Math.max(0, this.#playingUntil - Date.now());
   }
 
   /**
@@ -167,6 +197,21 @@ export class AudioDevice implements AudioInput, AudioOutput {
       this.#pendingFlushes.delete(pending);
       resolve({ heardMs });
     }
+  }
+
+  /** See DEAD_MIC_MS. */
+  #watchForDeadMic(frame: AudioFrame): void {
+    if (this.#deadMicReported) return;
+    if (this.bufferedMs() > 0 || !frame.every((sample) => sample === 0)) {
+      this.#silentMs = 0;
+      return;
+    }
+    this.#silentMs += (frame.length / this.#config.audio.frameRate) * 1000;
+    if (this.#silentMs < DEAD_MIC_MS) return;
+    // Said once. Repeating it every 20ms would bury the log and have the agent
+    // apologise on a loop.
+    this.#deadMicReported = true;
+    this.#fail(`microphone delivered only digital silence for ${DEAD_MIC_MS / 1000}s`);
   }
 
   #fail(message: string): void {

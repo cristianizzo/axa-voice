@@ -61,6 +61,17 @@ async function shutdown(code = 0): Promise<never> {
 }
 process.on('SIGINT', () => void shutdown(0));
 process.on('SIGTERM', () => void shutdown(0));
+// Node's default for both is to print and exit immediately, which skips the
+// shutdown above and leaves exactly the orphans it exists to prevent: a stray
+// helper holding the microphone, a whisper-server holding port 8178.
+process.on('uncaughtException', (error) => {
+  console.error(`\nerrore non gestito: ${error.stack ?? error.message}\n`);
+  void shutdown(1);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error(`\npromise rifiutata e non gestita: ${String(reason)}\n`);
+  void shutdown(1);
+});
 
 try {
   await checkHelper();

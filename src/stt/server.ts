@@ -55,7 +55,7 @@ export class WhisperServer {
     await preflight(this.#config);
     const { port, modelPath, vadModelPath, language } = this.#config.stt;
 
-    this.#proc = spawn(
+    const proc = spawn(
       'whisper-server',
       [
         '-m', modelPath,
@@ -67,12 +67,42 @@ export class WhisperServer {
       ],
       { stdio: ['ignore', 'ignore', 'pipe'] },
     );
+    this.#proc = proc;
+
+    // Drained, not ignored: a piped stderr nobody reads fills its OS buffer and
+    // then blocks whisper-server mid-inference. The tail is kept because it is
+    // the only place the real reason for a failed start is ever written.
+    let stderrTail = '';
+    proc.stderr!.on('data', (chunk: Buffer) => {
+      stderrTail = (stderrTail + chunk.toString('utf8')).slice(-2000);
+    });
+
+    // Without these a missing binary is an unhandled 'error' event, and a server
+    // that dies on startup is 20s of polling followed by a timeout message that
+    // points at the wrong thing entirely (spec §9).
+    let died: Error | undefined;
+    const reason = (): string => (stderrTail.trim() ? `\n${stderrTail.trim()}` : '');
+    proc.once('error', (err: Error) => {
+      died = new Error(
+        `whisper-server could not be started: ${err.message}. ` +
+          'Is it on your PATH? Install it with: brew install whisper-cpp',
+      );
+    });
+    proc.once('exit', (code) => {
+      died ??= new Error(`whisper-server exited with code ${code} before becoming healthy${reason()}`);
+    });
 
     const deadline = Date.now() + 20_000;
     for (;;) {
+      if (died) {
+        // No stop(): the process is already gone, and waiting on an 'exit' that
+        // has fired would add the full 2s grace period to a failed startup.
+        this.#proc = undefined;
+        throw died;
+      }
       if (Date.now() > deadline) {
         await this.stop();
-        throw new Error('whisper-server did not become healthy within 20s');
+        throw new Error(`whisper-server did not become healthy within 20s${reason()}`);
       }
       try {
         const res = await fetch(`${this.url}/health`);

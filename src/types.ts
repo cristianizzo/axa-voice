@@ -17,9 +17,21 @@ export interface AudioInput {
 /** Playback queue that can be silenced instantly. Same device as AudioInput. */
 export interface AudioOutput {
   enqueue(frame: AudioFrame): void;
-  /** Drop queued audio, silence within 50ms, and report what was actually HEARD. */
+  /**
+   * Drop queued audio, silence within 50ms, and report what was actually HEARD.
+   *
+   * `heardMs` counts from the moment playback started existing, not from the
+   * start of the current answer: the device has no idea what a turn is. Mapping
+   * it back onto a turn's text is the caller's job.
+   */
   flush(): Promise<{ heardMs: number }>;
   isPlaying(): boolean;
+  /**
+   * How much enqueued audio has not been played yet. Required, not a nicety: the
+   * queue is finite, TTS delivers far faster than real time, and a caller that
+   * enqueues a long answer without watching this loses its tail silently.
+   */
+  bufferedMs(): number;
 }
 
 export interface Transcriber {

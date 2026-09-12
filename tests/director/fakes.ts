@@ -86,23 +86,45 @@ class FakeAudioInput implements AudioInput {
   }
 }
 
+/**
+ * Models the real device, which is the whole point: `heardMs` there counts from
+ * the moment the helper started and is NEVER reset per turn. A fake that reset
+ * it would agree with a Director that made the same mistake, and the suite would
+ * certify a barge-in note claiming the user heard an answer they cut off.
+ *
+ * So a test says how much audio never made it out of the queue — `pendingMs` —
+ * and the fake does the lifetime arithmetic the helper does.
+ */
 class FakeAudioOutput implements AudioOutput {
-  /** Settable: a test decides how much of the answer the user actually heard. */
-  heardMs = 0;
+  /** Audio enqueued since the fake was created. Monotonic, like the device. */
+  enqueuedMs = 0;
+  /** What is still queued, unheard, at the next flush. */
+  pendingMs = 0;
   flushes = 0;
   readonly frames: AudioFrame[] = [];
 
+  readonly #config: Config;
+
+  constructor(config: Config) {
+    this.#config = config;
+  }
+
   enqueue(frame: AudioFrame): void {
     this.frames.push(frame);
+    this.enqueuedMs += (frame.length / this.#config.audio.deviceRate) * 1000;
   }
 
   async flush(): Promise<{ heardMs: number }> {
     this.flushes++;
-    return { heardMs: this.heardMs };
+    return { heardMs: Math.max(0, this.enqueuedMs - this.pendingMs) };
   }
 
   isPlaying(): boolean {
     return false;
+  }
+
+  bufferedMs(): number {
+    return 0;
   }
 }
 
@@ -316,7 +338,7 @@ class FakeVoice implements Voice {
 
 export function makeFakes(config: Config) {
   const audioIn = new FakeAudioInput();
-  const audioOut = new FakeAudioOutput();
+  const audioOut = new FakeAudioOutput(config);
   const transcriber = new FakeTranscriber();
   const turns = new FakeTurnDetector();
   const agent = new FakeAgentSession();

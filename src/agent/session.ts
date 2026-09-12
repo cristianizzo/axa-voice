@@ -16,6 +16,17 @@ Accorcia i percorsi dei file. Gli strumenti che hai sono veri: usali davvero.
 const INTERRUPT_DRAIN_MS = 2000;
 const CLOSE_TIMEOUT_MS = 2000;
 
+/**
+ * How long a result owed by an interrupted turn is still expected.
+ *
+ * The CLI sends exactly one result per turn it accepted, and they arrive in
+ * order, so the first result after a give-up is the dead turn's. It has to be
+ * swallowed or it ends the next turn the moment that turn starts. Bounded the
+ * other way too: a result that never arrives at all would otherwise leave the
+ * quarantine armed for ever, and it would eat a legitimate one instead.
+ */
+const STALE_RESULT_WINDOW_MS = 10_000;
+
 export function buildOptions(config: Config): Options {
   return {
     model: 'sonnet',
@@ -147,6 +158,8 @@ export class ClaudeAgentSession implements AgentSession {
   #blocks = new Map<number, { kind: 'text' | 'tool'; id?: string }>();
   /** tool_use id -> tool name, so a tool_result can close the bracket. */
   #toolNames = new Map<string, string>();
+  /** Armed while an interrupted turn still owes a result. See the constant. */
+  #staleResult: NodeJS.Timeout | undefined;
 
   constructor(
     config: Config,
@@ -223,9 +236,18 @@ export class ClaudeAgentSession implements AgentSession {
     }
 
     if (message.type === 'result') {
+      if (this.#takeStaleResult()) return;
       this.#emit({ type: 'done' });
       this.#endTurn();
     }
+  }
+
+  /** True if this result belongs to a turn that was already given up on. */
+  #takeStaleResult(): boolean {
+    if (!this.#staleResult) return false;
+    clearTimeout(this.#staleResult);
+    this.#staleResult = undefined;
+    return true;
   }
 
   #onStreamEvent(event: StreamEvent): void {
@@ -276,6 +298,9 @@ export class ClaudeAgentSession implements AgentSession {
     const turn = this.#turn;
     this.#turn = undefined;
     this.#blocks.clear();
+    // Not cleared, a tool_result left over from this turn brackets a tool the
+    // next turn never started.
+    this.#toolNames.clear();
     if (!turn) return;
     turn.ended = true;
     turn.wake?.();
@@ -323,7 +348,16 @@ export class ClaudeAgentSession implements AgentSession {
     // The killed turn still owes a result. Swallow it here, or it lands in the
     // middle of the next turn and ends it early.
     await withDeadline(turn.settled, this.#interruptDrainMs);
-    if (this.#turn === turn) this.#endTurn();
+    if (this.#turn !== turn) return;
+
+    // Still ours means the result never came within the drain window. Ending the
+    // turn locally frees the Director, but the result is still in the pipe and
+    // has to be caught when it lands.
+    this.#staleResult = setTimeout(() => {
+      this.#staleResult = undefined;
+    }, STALE_RESULT_WINDOW_MS);
+    this.#staleResult.unref();
+    this.#endTurn();
   }
 
   notifyInterruption(spokenSoFar: string, userSaid: string): void {
@@ -363,6 +397,7 @@ export class ClaudeAgentSession implements AgentSession {
   async close(): Promise<void> {
     const query = this.#query;
     this.#query = undefined;
+    this.#takeStaleResult();
     this.#input.end();
     const returned = query?.return(undefined).then(
       () => undefined,

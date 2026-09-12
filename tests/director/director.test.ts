@@ -44,7 +44,8 @@ test('barge-in flushes, interrupts, and reports what was actually heard', async 
   await f.tick();
   assert.equal(director.state, 'SPEAKING');
 
-  f.audioOut.heardMs = 1412.7;
+  // Half the answer was still sitting in the queue when the user cut in.
+  f.audioOut.pendingMs = f.audioOut.enqueuedMs / 2;
   f.turns.speechStart();
   await f.tick();
 
@@ -76,7 +77,7 @@ test('the interruption note never claims more was heard than was played', async 
   await f.tick();
 
   // Cut in almost immediately: the user heard the opening words and nothing else.
-  f.audioOut.heardMs = 300;
+  f.audioOut.pendingMs = f.audioOut.enqueuedMs - 300;
   f.turns.speechStart();
   await f.tick();
   f.transcriber.final('aspetta');
@@ -89,6 +90,98 @@ test('the interruption note never claims more was heard than was played', async 
     !heard.includes('castello'),
     'telling Claude the ending was heard is what makes it answer from a context the user never got',
   );
+
+  await director.stop();
+});
+
+test('the second barge-in is measured as carefully as the first', async () => {
+  const f = makeFakes(config);
+  const director = new Director(f.deps);
+  await director.start();
+
+  f.turns.speechStart();
+  f.transcriber.final('raccontami una storia');
+  f.turns.turnEnd();
+  await f.tick();
+  f.agent.emitText('Cera una volta un re che viveva in un castello.');
+  await f.tick();
+
+  f.audioOut.pendingMs = f.audioOut.enqueuedMs / 2;
+  f.turns.speechStart();
+  await f.tick();
+  f.transcriber.final('aspetta');
+  f.turns.turnEnd();
+  await f.tick();
+
+  // Turn two. The device's counter keeps climbing from where turn one left it:
+  // it has no idea a new turn started. Measuring the new answer against a total
+  // that restarted at zero makes every cut-off from here on look complete.
+  const answerStartedAt = f.audioOut.enqueuedMs;
+  f.agent.emitText('Il secondo re invece viveva dentro una torre altissima.');
+  await f.tick();
+  assert.equal(director.state, 'SPEAKING');
+
+  f.audioOut.pendingMs = f.audioOut.enqueuedMs - (answerStartedAt + 300);
+  f.turns.speechStart();
+  await f.tick();
+  f.transcriber.final('no basta');
+  f.turns.turnEnd();
+  await f.tick();
+
+  const heard = f.agent.interruptionNote!.spokenSoFar;
+  assert.ok(heard.length > 0, 'the opening words did reach the user');
+  assert.ok(
+    !heard.includes('torre'),
+    'claiming the whole answer was heard is what makes Claude answer from a context the user never got',
+  );
+  assert.ok(!heard.includes('castello'), 'and the previous turn is not part of this answer');
+
+  await director.stop();
+});
+
+test('a filler already speaking is cut off by the answer, not left to overlap', async () => {
+  const f = makeFakes(config);
+  const director = new Director(f.deps);
+  await director.start();
+
+  f.turns.speechStart();
+  f.transcriber.final('cerca sul web il meteo');
+  f.turns.turnEnd();
+  await f.tick();
+
+  // The filler starts speaking, and the first sentence lands while it is still
+  // going. Cancelling only the timer leaves the two talking over each other.
+  f.advance(config.director.fillerAfterMs + 10);
+  f.agent.emitText('A Valenza ci sono venti gradi.');
+  await f.tick();
+
+  assert.equal(f.voice.aborts, 1, 'the filler must be silenced, not merely un-scheduled');
+  assert.ok(f.voice.spoken.includes('A Valenza ci sono venti gradi.'));
+
+  await director.stop();
+});
+
+test('a long answer waits for the speakers instead of overflowing the queue', async () => {
+  const f = makeFakes(config);
+  const director = new Director(f.deps);
+  await director.start();
+
+  // The device queue holds four seconds and the voice is far faster than
+  // speech. Full at first, then draining.
+  let checks = 0;
+  f.audioOut.bufferedMs = () => (checks++ < 3 ? 3000 : 0);
+
+  f.turns.speechStart();
+  f.transcriber.final('raccontami una storia lunga');
+  f.turns.turnEnd();
+  await f.tick();
+  f.agent.emitText('Cera una volta un re.');
+  f.agent.emitDone();
+  await new Promise((resolve) => setTimeout(resolve, 400));
+
+  assert.ok(checks > 3, 'the answer must wait while the queue is full');
+  assert.ok(f.audioOut.frames.length > 0, 'and then arrive whole, not truncated');
+  assert.equal(director.state, 'LISTENING');
 
   await director.stop();
 });
