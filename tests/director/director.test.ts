@@ -31,6 +31,68 @@ test('a full turn walks LISTENING -> HEARING -> THINKING -> SPEAKING -> LISTENIN
   await director.stop();
 });
 
+test('speech while thinking does not interrupt the turn', async () => {
+  const f = makeFakes(config);
+  const d = new Director(f.deps);
+  await d.start();
+  // First token not yet emitted: FakeAgentSession.send() blocks until an event
+  // is pushed, so the Director simply sits in THINKING.
+  f.turns.speechStart();
+  f.transcriber.final('quando gioca il napoli');
+  f.turns.turnEnd();
+  await f.tick();
+  assert.equal(d.state, 'THINKING');
+
+  // The prompt that used to kill the search.
+  f.turns.speechStart();
+  f.transcriber.final('allora');
+  f.turns.turnEnd();
+  await f.tick();
+  assert.equal(f.agent.interrupts, 0, 'thinking is not interruptible');
+  assert.equal(d.state, 'THINKING', 'the turn survives');
+
+  await d.stop();
+});
+
+test('speech while speaking still interrupts', async () => {
+  const f = makeFakes(config);
+  const d = new Director(f.deps);
+  await d.start();
+  f.turns.speechStart();
+  f.transcriber.final('domanda');
+  f.turns.turnEnd();
+  await f.tick();
+  f.agent.emitText('Questa è una risposta lunga.');
+  await f.tick();
+  assert.equal(d.state, 'SPEAKING');
+
+  f.turns.speechStart();
+  f.transcriber.final('no aspetta');
+  await f.tick();
+  assert.equal(f.agent.interrupts, 1, 'barge-in is the whole point of the project');
+
+  await d.stop();
+});
+
+test('a bare stop command while thinking cancels the turn', async () => {
+  const f = makeFakes(config);
+  const d = new Director(f.deps);
+  await d.start();
+  f.turns.speechStart();
+  f.transcriber.final('cerca qualcosa');
+  f.turns.turnEnd();
+  await f.tick();
+
+  f.turns.speechStart();
+  f.transcriber.final('basta');
+  f.turns.turnEnd();
+  await f.tick();
+  assert.equal(f.agent.interrupts, 1);
+  assert.equal(d.state, 'LISTENING');
+
+  await d.stop();
+});
+
 test('barge-in flushes, interrupts, and reports what was actually heard', async () => {
   const f = makeFakes(config);
   const director = new Director(f.deps);

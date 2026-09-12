@@ -1,7 +1,7 @@
 import type { Config } from '../config.ts';
 import { clean } from '../stt/clean.ts';
 import { toSpokenForm } from '../filter/speech-filter.ts';
-import { interpretApproval } from './approval.ts';
+import { interpretApproval, isStopCommand } from './approval.ts';
 import type {
   AgentSession,
   AudioFrame,
@@ -101,6 +101,16 @@ export class Director {
   #lastFinal = '';
 
   /**
+   * True whenever the turn detector reports the user speaking, independent of
+   * `#state`. `#state` answers what the agent is doing; this answers whether
+   * the user is being recorded — the two used to be the same question, which is
+   * exactly what let a follow-up during THINKING look like a cancellation.
+   */
+  #capturing = false;
+  /** What the user said while THINKING, waiting to be folded into the next turn. */
+  #queued: string[] = [];
+
+  /**
    * Bumped whenever the current turn stops mattering — a new turn, a barge-in,
    * an abandoned approval. The pipeline is several async generators deep, so it
    * keeps running for a while after the decision to drop it; checking this
@@ -198,19 +208,28 @@ export class Director {
     // The detector first: it may turn this very frame into a speech onset, and
     // the frame that crossed the threshold is one whisper needs.
     this.#deps.turns.push(frame, this.#lastPartial);
-    if (this.#state === 'HEARING' || this.#state === 'AWAITING_APPROVAL') {
-      this.#stream?.push(frame);
-    }
+    // Capture is now independent of `#state`. THINKING must be able to record
+    // the user without ceasing to be THINKING: what they say is a follow-up,
+    // not a cancellation. Gating on `#capturing` alone is still what keeps
+    // whisper from transcribing an empty room during LISTENING.
+    if (this.#capturing) this.#stream?.push(frame);
   }
 
   #onSpeechStart(): void {
+    this.#capturing = true;
     // Already listening: HEARING is mid-utterance, AWAITING_APPROVAL is waiting
     // for an answer. Neither is interrupted by the user starting to talk.
     if (this.#state === 'HEARING' || this.#state === 'AWAITING_APPROVAL') return;
+    // THINKING is silent work: talking during it adds to the conversation
+    // (spec §1/§2) instead of destroying it, so it stays THINKING — only
+    // capture started. SPEAKING is the one state barge-in still applies to
+    // (spec §6 line 411); LISTENING simply becomes HEARING, the ordinary start
+    // of an utterance.
+    if (this.#state === 'THINKING') return;
 
-    const wasAnswering = this.#state === 'THINKING' || this.#state === 'SPEAKING';
+    const wasSpeaking = this.#state === 'SPEAKING';
     this.#state = 'HEARING';
-    if (wasAnswering) void this.#bargeIn();
+    if (wasSpeaking) void this.#bargeIn();
   }
 
   async #bargeIn(): Promise<void> {
@@ -256,6 +275,25 @@ export class Director {
   }
 
   async #onTurnEnd(): Promise<void> {
+    if (this.#state === 'THINKING') {
+      const id = this.#turnId;
+      const said = await this.#takeFinal();
+      // Forcing the final transcription is a round trip; a barge-in, a stop
+      // command, or stop() itself can all land inside it.
+      if (this.#turnId !== id) return;
+      this.#capturing = false;
+      if (isStopCommand(said)) {
+        this.#turnId++;
+        this.#tts?.abort();
+        this.#stopFiller();
+        void this.#deps.agent.interrupt();
+        this.#state = 'LISTENING';
+        return;
+      }
+      if (said) this.#queued.push(said); // Task 3 drains this into the next turn.
+      return;
+    }
+
     if (this.#state !== 'HEARING' && this.#state !== 'AWAITING_APPROVAL') return;
 
     const id = this.#turnId;
@@ -265,6 +303,7 @@ export class Director {
     // afterwards would answer a question that no longer exists, or start a turn
     // out of a state that has already moved on.
     if (this.#turnId !== id) return;
+    this.#capturing = false;
 
     if (this.#state === 'AWAITING_APPROVAL') {
       this.#answer(text);
