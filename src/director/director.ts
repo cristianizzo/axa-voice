@@ -131,6 +131,22 @@ export class Director {
   #fillerIndex = 0;
   /** Armed while a tool is running, re-armed after every line it speaks. */
   #progressTimer: unknown;
+  /**
+   * How many tool calls are outstanding right now, this turn.
+   *
+   * Claude routinely fires tools in parallel — `session.ts` brackets each
+   * content-block index with its own start/end — so a fast `Read` finishing
+   * beside a slow `WebSearch` must not silence the narration the `WebSearch`
+   * still needs. A count, not a set keyed by name: two calls to the same tool
+   * (two `Read`s at once) would collide on one key, and the first `end` would
+   * then stop narration for the one still running — the exact bug this
+   * replaces, just triggered by a duplicate name instead of a different one.
+   * Reset to 0 at the top of `#run`, same as `#asideMs`, so a tool whose `end`
+   * never arrives — an interrupt, a crash — cannot wedge narration into the
+   * next turn: nothing outside the dead turn's own generator ever reads it
+   * again once that reset happens.
+   */
+  #toolsRunning = 0;
 
   /** Sentences handed to the voice this turn. */
   #spoken: string[] = [];
@@ -430,6 +446,7 @@ export class Director {
     // lands, so a filler played in between is not counted as answer.
     this.#answerFromMs = this.#enqueuedMs;
     this.#asideMs = 0;
+    this.#toolsRunning = 0;
 
     const director = this;
     // The filter eats the whole event stream and yields only sentences, so the
@@ -441,8 +458,18 @@ export class Director {
       for await (const event of director.#deps.agent.send(text)) {
         if (director.#turnId !== id) return;
         if (event.type === 'tool') {
-          if (event.phase === 'start') director.#startProgress(event.name);
-          else director.#stopProgress();
+          if (event.phase === 'start') {
+            // Only the first of a group of parallel calls arms the timer; a
+            // second, third, ... call arriving while one is already running
+            // must not restart the cadence or reset which line comes next.
+            if (director.#toolsRunning++ === 0) director.#startProgress(event.name);
+          } else {
+            // Floored at 0: an `end` for a tool whose `start` belonged to a
+            // turn that already ended cannot happen (the turnId guard above
+            // returns first), but nothing here should go negative if it ever did.
+            director.#toolsRunning = Math.max(0, director.#toolsRunning - 1);
+            if (director.#toolsRunning === 0) director.#stopProgress();
+          }
         }
         yield event;
       }

@@ -469,6 +469,48 @@ test('a long tool call is narrated, and stops when the tool ends', async () => {
   await d.stop();
 });
 
+test('narration survives one tool of a parallel pair finishing before the other', async () => {
+  const f = makeFakes(config);
+  const d = new Director(f.deps);
+  await d.start();
+  f.turns.speechStart();
+  f.transcriber.final('cerca il napoli e leggi la pagina');
+  f.turns.turnEnd();
+  await f.tick();
+  f.agent.emitText('Aspetta, controllo.');
+  await f.tick();
+
+  // Claude routinely fires tools in parallel: session.ts brackets each with
+  // its own start/end, one bracket per content-block index. A fast Read
+  // finishing alongside a slow WebSearch is exactly the case a lone end per
+  // tool gets wrong.
+  f.agent.emitTool('Read', 'start');
+  f.agent.emitTool('WebSearch', 'start');
+  await f.tick();
+
+  const narration = (): string[] => f.voice.spoken.filter((s) => s !== 'Aspetta, controllo.');
+
+  f.advance(3000);
+  await f.tick();
+  assert.equal(narration().length, 1, 'it narrates while both tools are running');
+
+  // The fast one finishes; the slow one has not. Its end must not read as
+  // "the tool call is over" while a sibling call is still outstanding.
+  f.agent.emitTool('Read', 'end');
+  await f.tick();
+  f.advance(3000);
+  await f.tick();
+  assert.equal(narration().length, 2, 'it keeps talking while WebSearch is still running');
+
+  f.agent.emitTool('WebSearch', 'end');
+  await f.tick();
+  f.advance(9000);
+  await f.tick();
+  assert.equal(narration().length, 2, 'and only stops once the last one ends');
+
+  await d.stop();
+});
+
 test('a line spoken mid-answer does not distort what the user heard', async () => {
   const f = makeFakes(config);
   const d = new Director(f.deps);
