@@ -311,6 +311,17 @@ export class Director {
         `asideMs=${this.#asideMs} heardMs=${heardMs} prefix=${JSON.stringify(this.#pendingNote)}`,
     );
 
+    // flush() discarded audio `#enqueuedMs` had already counted — it is a
+    // lifetime counter and never rolls back on its own — so the two timelines
+    // drift apart by the dropped amount at each barge-in until, on the second,
+    // `heardMs - #answerFromMs` is negative and the note reports that nothing
+    // was heard. After a flush, what the device rendered IS everything that
+    // ever reached the speakers, so adopt that count. `#answerFromMs` and
+    // `#asideMs` need nothing here: the turn being cut off is over (the turnId
+    // above killed it), and #run/#play re-anchor both against this
+    // resynchronised total when the next turn begins.
+    this.#enqueuedMs = heardMs;
+
     // interrupt(), not abort(): aborting tears the session down and costs ~2s.
     await this.#deps.agent.interrupt();
   }
