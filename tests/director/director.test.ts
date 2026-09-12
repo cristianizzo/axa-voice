@@ -439,6 +439,111 @@ test('a filler already speaking is cut off by the answer, not left to overlap', 
   await director.stop();
 });
 
+test('a long tool call is narrated, and stops when the tool ends', async () => {
+  const f = makeFakes(config);
+  const d = new Director(f.deps);
+  await d.start();
+  f.turns.speechStart();
+  f.transcriber.final('cerca il napoli');
+  f.turns.turnEnd();
+  await f.tick();
+  f.agent.emitText('Aspetta, controllo.');
+  await f.tick();
+  f.agent.emitTool('WebSearch', 'start');
+  await f.tick();
+
+  // f.voice.spoken holds the answer's sentences too, so the narration is
+  // counted by what only a progress line for this tool can say.
+  const narration = (): string[] => f.voice.spoken.filter((s) => /cercando/i.test(s));
+
+  f.advance(3000);
+  await f.tick();
+  assert.equal(narration().length, 1, 'it says it is still working');
+
+  f.agent.emitTool('WebSearch', 'end');
+  await f.tick();
+  f.advance(9000);
+  await f.tick();
+  assert.equal(narration().length, 1, 'and stops once the tool is done');
+
+  await d.stop();
+});
+
+test('a line spoken mid-answer does not distort what the user heard', async () => {
+  const f = makeFakes(config);
+  const d = new Director(f.deps);
+  await d.start();
+  f.turns.speechStart();
+  f.transcriber.final('domanda');
+  f.turns.turnEnd();
+  await f.tick();
+
+  f.agent.emitText('Prima frase. Seconda frase.');
+  await f.tick();
+  // The only thing that speaks while an answer is already running: a tool
+  // starts behind the sentence just spoken, and the wait is narrated.
+  f.agent.emitTool('WebSearch', 'start');
+  await f.tick();
+  f.advance(3000);
+  await f.tick();
+  f.audioOut.pendingMs = 0; // everything was rendered
+
+  f.turns.speechStart();
+  await f.tick();
+  f.transcriber.final('ok basta');
+  f.turns.turnEnd();
+  await f.tick();
+  // Without aside accounting the answer looks longer than it was and the
+  // prefix comes back truncated, telling Claude the user missed words they heard.
+  assert.equal(f.agent.interruptionNote!.spokenSoFar, 'Prima frase. Seconda frase.');
+
+  await d.stop();
+});
+
+test('a line spoken between two sentences is not heard answer', async () => {
+  const f = makeFakes(config);
+  const d = new Director(f.deps);
+  await d.start();
+  f.turns.speechStart();
+  f.transcriber.final('cerca il napoli');
+  f.turns.turnEnd();
+  await f.tick();
+
+  f.agent.emitText('Prima frase.');
+  await f.tick();
+  f.agent.emitTool('WebSearch', 'start');
+  await f.tick();
+  f.advance(3000);
+  await f.tick();
+  f.agent.emitTool('WebSearch', 'end');
+  await f.tick();
+
+  // The answer resumes after the narration, so the aside sits INSIDE the
+  // answer's stretch of the device timeline — the case #answerFromMs cannot
+  // see, because it is already behind it.
+  const beforeTail = f.audioOut.enqueuedMs;
+  f.agent.emitText('Il Napoli gioca domenica sera contro la Roma allo stadio Maradona.');
+  await f.tick();
+  // The user cut in the moment the second sentence began: they heard the first
+  // one and the narration, and not one word of the second.
+  f.audioOut.pendingMs = f.audioOut.enqueuedMs - beforeTail;
+
+  f.turns.speechStart();
+  await f.tick();
+  f.transcriber.final('aspetta');
+  f.turns.turnEnd();
+  await f.tick();
+
+  const heard = f.agent.interruptionNote!.spokenSoFar;
+  assert.equal(heard, 'Prima frase.', 'the first sentence, and nothing after it');
+  assert.ok(
+    !heard.includes('Napoli'),
+    'counting the narration as answer makes the note claim words the user never got',
+  );
+
+  await d.stop();
+});
+
 test('a long answer waits for the speakers instead of overflowing the queue', async () => {
   const f = makeFakes(config);
   const director = new Director(f.deps);

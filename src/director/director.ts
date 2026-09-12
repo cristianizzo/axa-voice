@@ -2,6 +2,7 @@ import type { Config } from '../config.ts';
 import { clean } from '../stt/clean.ts';
 import { toSpokenForm } from '../filter/speech-filter.ts';
 import { interpretApproval, isStopCommand } from './approval.ts';
+import { progressLine } from './progress.ts';
 import type {
   AgentSession,
   AudioFrame,
@@ -78,6 +79,12 @@ const TURN_FAILED = 'Scusa, qualcosa è andato storto. Riprova.';
 const PLAYBACK_HIGH_WATER_MS = 2000;
 const PLAYBACK_POLL_MS = 50;
 
+/**
+ * How often to say something while a tool runs. Long enough not to nag, short
+ * enough that the user never wonders whether the thing is still alive.
+ */
+const PROGRESS_EVERY_MS = 3000;
+
 async function only(text: string): Promise<AsyncIterable<string>> {
   return (async function* () {
     yield text;
@@ -122,6 +129,8 @@ export class Director {
   #line: AbortController | undefined;
   #fillerTimer: unknown;
   #fillerIndex = 0;
+  /** Armed while a tool is running, re-armed after every line it speaks. */
+  #progressTimer: unknown;
 
   /** Sentences handed to the voice this turn. */
   #spoken: string[] = [];
@@ -183,6 +192,7 @@ export class Director {
     this.#turnId++;
     this.#tts?.abort();
     this.#stopFiller();
+    this.#stopProgress();
     this.#resolveApproval(false);
     // Nothing is coming back to drain this session's queue.
     this.#queued = [];
@@ -247,6 +257,7 @@ export class Director {
   async #bargeIn(): Promise<void> {
     this.#turnId++;
     this.#stopFiller();
+    this.#stopProgress();
     this.#tts?.abort();
     // A fresh utterance that barges in supersedes the turn it cut off — and
     // anything that turn had queued from an earlier follow-up. Keeping it
@@ -328,6 +339,9 @@ export class Director {
         this.#turnId++;
         this.#tts?.abort();
         this.#stopFiller();
+        // "basta" said into a running search has to silence the search's own
+        // narration too, or the cancelled turn keeps talking for three seconds.
+        this.#stopProgress();
         // A permission request can have arrived inside the await above without
         // bumping #turnId. Leaving it unresolved strands the SDK's canUseTool
         // promise with its timer armed, and approvalTimeoutMs later it speaks
@@ -418,10 +432,28 @@ export class Director {
     this.#asideMs = 0;
 
     const director = this;
+    // The filter eats the whole event stream and yields only sentences, so the
+    // tool brackets — the only warning anyone gets that the next minute is
+    // going to be silent — are invisible downstream. Observe them on the way
+    // past and forward them unchanged: the filter needs a tool event to close
+    // the text block it interrupts.
+    const observed = (async function* () {
+      for await (const event of director.#deps.agent.send(text)) {
+        if (director.#turnId !== id) return;
+        if (event.type === 'tool') {
+          if (event.phase === 'start') director.#startProgress(event.name);
+          else director.#stopProgress();
+        }
+        yield event;
+      }
+    })();
+
     const sentences = (async function* () {
-      for await (const sentence of director.#deps.filter.filter(director.#deps.agent.send(text))) {
+      for await (const sentence of director.#deps.filter.filter(observed)) {
         if (director.#turnId !== id) return;
         director.#stopFiller();
+        // The answer itself is now the thing covering the silence.
+        director.#stopProgress();
         director.#spoken.push(sentence);
         if (director.#state === 'THINKING') director.#state = 'SPEAKING';
         yield sentence;
@@ -437,6 +469,9 @@ export class Director {
 
     if (this.#turnId !== id) return;
     this.#stopFiller();
+    // A stream that ends inside a tool bracket — an interrupt, a crashed tool —
+    // leaves the timer armed with nothing left to narrate.
+    this.#stopProgress();
     this.#state = 'LISTENING';
 
     // Said while the answer was in flight. It was deliberately not allowed to
@@ -546,6 +581,54 @@ export class Director {
     this.#line = undefined;
   }
 
+  /**
+   * Narrate a tool call for as long as it runs.
+   *
+   * The filler covers the wait for the first token and is cancelled by the
+   * first sentence; the tool then runs behind that sentence, covered by
+   * nothing. A web search is minutes of it — the silence that started this
+   * project. Unlike the filler this repeats, because the wait it is covering
+   * has no known length.
+   */
+  #startProgress(tool: string): void {
+    this.#stopProgress();
+    // The turn this tool belongs to. `Timers` has no setInterval, so the timer
+    // re-arms itself, and a re-armed timer outlives whatever cleared the turn
+    // unless it checks.
+    const id = this.#turnId;
+    let index = 0;
+
+    const arm = (): void => {
+      this.#progressTimer = this.#timers.setTimeout(() => {
+        this.#progressTimer = undefined;
+        if (this.#turnId !== id) return;
+        // Narrating over the question the user is being asked would make the
+        // question unanswerable. The tool has not started running yet anyway —
+        // it is waiting for the very answer we would be talking over. Silence
+        // now, re-armed: approval granted, the narration resumes on its own.
+        if (this.#state !== 'AWAITING_APPROVAL') {
+          void this.#say(progressLine(tool, index++));
+        }
+        arm();
+      }, PROGRESS_EVERY_MS);
+    };
+    arm();
+  }
+
+  /**
+   * Same reasoning as `#stopFiller`, and the same channel: a progress line
+   * already out loud has to be cut, not merely un-scheduled, or it talks over
+   * the answer that has just arrived to replace it.
+   */
+  #stopProgress(): void {
+    if (this.#progressTimer !== undefined) {
+      this.#timers.clearTimeout(this.#progressTimer);
+      this.#progressTimer = undefined;
+    }
+    this.#line?.abort();
+    this.#line = undefined;
+  }
+
   // ----------------------------------------------------------------- approval
 
   #onPermission(req: PermissionRequest): Promise<boolean> {
@@ -617,6 +700,7 @@ export class Director {
     this.#turnId++;
     this.#tts?.abort();
     this.#stopFiller();
+    this.#stopProgress();
     this.#resolveApproval(false);
     // The turn that would have drained this is dead, and an apology is about
     // to be spoken in its place — nothing queued against it belongs after that.
