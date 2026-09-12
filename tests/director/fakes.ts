@@ -103,6 +103,18 @@ class FakeAudioOutput implements AudioOutput {
   flushes = 0;
   readonly frames: AudioFrame[] = [];
 
+  /**
+   * Audio this device will never render, because a flush threw it away.
+   *
+   * The helper renders a frame or discards it; it never re-renders one.
+   * `Ring.dropAll()` moves the read index up to the write index, and
+   * `framesConsumed` — the only counter `heardMs` is derived from — counts
+   * frames actually handed to the audio unit. So a flush does not merely
+   * postpone the audio still in the queue, it deletes it from the heard
+   * timeline permanently, and every later `heardMs` is short by that much.
+   */
+  #discardedMs = 0;
+
   readonly #config: Config;
 
   constructor(config: Config) {
@@ -116,7 +128,13 @@ class FakeAudioOutput implements AudioOutput {
 
   async flush(): Promise<{ heardMs: number }> {
     this.flushes++;
-    return { heardMs: Math.max(0, this.enqueuedMs - this.pendingMs) };
+    const heardMs = Math.max(0, this.enqueuedMs - this.pendingMs - this.#discardedMs);
+    this.#discardedMs += this.pendingMs;
+    // The queue is empty on the other side of a flush: what was pending is now
+    // discarded, and leaving it pending would have the next flush drop the same
+    // milliseconds twice.
+    this.pendingMs = 0;
+    return { heardMs };
   }
 
   isPlaying(): boolean {
