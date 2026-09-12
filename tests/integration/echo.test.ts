@@ -69,10 +69,12 @@ test(
     timeout: 120_000,
   },
   async () => {
-    const live = loadConfig(process.env);
-    const device = new AudioDevice(live);
-    const whisper = new WhisperServer(live);
-    const turns = new VadTurnDetector(live);
+    // No real key: this test never speaks through the TTS. It plays the fixture
+    // straight into the device, because the question is what the microphone
+    // hears from the speakers, not what produced the sound.
+    const device = new AudioDevice(config);
+    const whisper = new WhisperServer(config);
+    const turns = new VadTurnDetector(config);
 
     let selfInterrupts = 0;
     turns.onSpeechStart(() => {
@@ -82,7 +84,7 @@ test(
     await whisper.start();
     await device.start();
 
-    const stream = await new WhisperTranscriber(live).open();
+    const stream = await new WhisperTranscriber(config).open();
     let transcript = '';
     stream.onFinal((text) => {
       transcript = text;
@@ -96,8 +98,8 @@ test(
     });
 
     try {
-      const speech = resample(readWavData(FIXTURE), live.audio.frameRate, live.audio.deviceRate);
-      const frameSamples = Math.round((live.audio.deviceRate * FRAME_MS) / 1000);
+      const speech = resample(readWavData(FIXTURE), config.audio.frameRate, config.audio.deviceRate);
+      const frameSamples = Math.round((config.audio.deviceRate * FRAME_MS) / 1000);
 
       const until = Date.now() + PLAYBACK_MS;
       while (Date.now() < until) {

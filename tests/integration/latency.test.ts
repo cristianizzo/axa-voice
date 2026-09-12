@@ -18,6 +18,15 @@ import type { AudioFrame, AudioInput, AudioOutput, Unsubscribe } from '../../src
  * between is what the 1300ms budget is spent on (spec §4).
  */
 
+// The only test that spends real money, so it needs the real key. `npm start`
+// reads it from .env; running the suite has to do the same, or AXA_LIVE=1 fails
+// on a missing key that is in fact sitting right there.
+try {
+  process.loadEnvFile(new URL('../../.env', import.meta.url));
+} catch {
+  // Not an error: the key may come from the shell instead. loadConfig decides.
+}
+
 const FIXTURE = new URL('../fixtures/utterance.wav', import.meta.url);
 const BUDGET_MS = 1300;
 const TURNS = 4;

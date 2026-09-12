@@ -673,7 +673,7 @@ test('a read-only tool reaching the callback is asked about, not assumed impossi
 // --- Live ------------------------------------------------------------------
 
 test(
-  'live: first token on turn N is under the 1000 ms the budget assumes',
+  'live: first token on turn N stays under the 1500 ms sanity ceiling',
   { skip: process.env.AXA_LIVE ? false : 'set AXA_LIVE=1 to spend money on a real session' },
   async () => {
     const session = new ClaudeAgentSession(loadConfig({ CARTESIA_API_KEY: 'sk_test' }));
