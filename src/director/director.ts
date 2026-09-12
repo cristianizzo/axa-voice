@@ -310,10 +310,12 @@ export class Director {
     const answerMs = this.#enqueuedMs - this.#answerFromMs - this.#asideMs;
     if (!text || answerMs <= 0) return '';
 
-    // Asides and answer never overlap, and an aside always precedes the answer
-    // audio queued after it, so subtracting the total is exact whenever the
-    // asides were fully played. Barging in mid-aside overcounts slightly; the
-    // clamp below is what keeps that honest.
+    // `#asideMs` counts aside audio enqueued, not rendered, so barging in
+    // mid-aside subtracts a full aside the user only partly heard, and
+    // `heardOfAnswer` under-counts by the unplayed remainder. That is the safe
+    // direction: §6 exists to stop the note from claiming the user heard more
+    // than they did, and a short prefix does not. The `Math.min` below is an
+    // upper clamp against `answerMs` — it has nothing to do with this case.
     const heardOfAnswer = Math.min(heardMs - this.#answerFromMs - this.#asideMs, answerMs);
     if (heardOfAnswer <= 0) return '';
     if (heardOfAnswer >= answerMs) return text;
