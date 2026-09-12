@@ -6,6 +6,12 @@ export interface AudioInput {
   start(): Promise<void>;
   stop(): Promise<void>;
   onFrame(cb: (frame: AudioFrame) => void): Unsubscribe;
+  /**
+   * A microphone that dies delivers digital silence, which is indistinguishable
+   * from a quiet room. Without a way to report that, the app waits for a turn
+   * that can never come (spec §9), so this is required, not optional.
+   */
+  onError(cb: (message: string) => void): Unsubscribe;
 }
 
 /** Playback queue that can be silenced instantly. Same device as AudioInput. */
@@ -35,6 +41,15 @@ export interface TurnDetector {
 
 export interface Voice {
   synthesize(text: AsyncIterable<string>, signal: AbortSignal): AsyncIterable<AudioFrame>;
+  /**
+   * Open the connection the next turn will use, off the critical path. Measured
+   * at 458-500ms for Cartesia, and it does NOT amortise: a voice with a cold
+   * socket pays it on every single turn. Optional because a local or offline
+   * voice has nothing to warm.
+   */
+  prewarm?(): void;
+  /** Release whatever prewarm() reserved. Optional for the same reason. */
+  close?(): void;
 }
 
 export type AgentEvent =
