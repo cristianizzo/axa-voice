@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { interpretApproval } from '../../src/director/approval.ts';
+import { interpretApproval, isStopCommand } from '../../src/director/approval.ts';
 
 test('recognises clear approval', () => {
   for (const t of ['sì', 'si', 'Sì!', 'ok', 'okay', 'vai', 'fallo', 'certo', 'va bene', 'procedi']) {
@@ -101,4 +101,32 @@ test('a long utterance is never an approval however it starts', () => {
     'yes',
   );
   assert.notEqual(interpretApproval('ok ma prima dimmi cosa fa quel comando'), 'yes');
+});
+
+// --- stop command ---------------------------------------------------------
+
+test('a bare stop command stops', () => {
+  for (const s of ['basta', 'stop', 'lascia stare', 'annulla', 'fermati', 'Basta.', '  STOP  ']) {
+    assert.equal(isStopCommand(s), true, s);
+  }
+});
+
+test('a stop word inside a longer sentence does not stop', () => {
+  for (const s of [
+    'non dirmi basta',
+    'poi ti dico quando basta',
+    'lascia stare quello e cercami il meteo',
+  ]) {
+    assert.equal(isStopCommand(s), false, s);
+  }
+});
+
+test('aspetta does not stop, but is still a refusal for approvals', () => {
+  // The two vocabularies overlap without being the same set (spec §3).
+  assert.equal(isStopCommand('aspetta'), false);
+  assert.equal(interpretApproval('aspetta'), 'no');
+});
+
+test('empty and hallucinated input never stops', () => {
+  for (const s of ['', '   ', '[Musica]', '(rumore)']) assert.equal(isStopCommand(s), false);
 });

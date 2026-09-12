@@ -58,3 +58,22 @@ export function interpretApproval(text: string): ApprovalAnswer {
   if (NO.has(normalised)) return 'no';
   return 'unclear';
 }
+
+/**
+ * Deliberately NOT the `NO` set, which contains "aspetta". For a permission
+ * answer that is a refusal; for work in flight it almost always means "hold on,
+ * I am adding something" — the opposite of stopping. The sets overlap; merging
+ * them would silently cancel work the user was trying to extend.
+ */
+const STOP = new Set([
+  'basta', 'stop', 'lascia stare', 'lascia perdere',
+  'annulla', 'annullalo', 'ferma', 'fermati', 'fermo',
+]);
+
+/** Whole-utterance match, like interpretApproval: "non dirmi basta" is not a stop. */
+export function isStopCommand(text: string): boolean {
+  const normalised = normalise(text);
+  if (!normalised) return false;
+  if (normalised.split(' ').length > MAX_WORDS) return false;
+  return STOP.has(normalised);
+}
