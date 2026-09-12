@@ -134,6 +134,16 @@ export class Director {
   #enqueuedMs = 0;
   /** Where in that timeline this turn's answer began. */
   #answerFromMs = 0;
+  /**
+   * Audio the Director spoke on its own behalf since this answer began.
+   *
+   * `#answerFromMs` alone only excludes lines spoken *before* the first answer
+   * frame — a filler, an approval question. A line spoken while the answer is
+   * already running, which is what narrating a tool call is, lands inside the
+   * answer's stretch of the timeline and would otherwise inflate its measured
+   * duration, skewing the prefix even though `#answerFromMs` never moved.
+   */
+  #asideMs = 0;
 
   /** What the user heard before cutting in, waiting for what they say next. */
   #pendingNote: string | undefined;
@@ -264,14 +274,20 @@ export class Director {
    * sentence-to-audio boundary to read and proportion by character count is the
    * honest approximation. It is clamped at both ends: audio that never left the
    * queue cannot have been heard, and audio enqueued before the answer began —
-   * a filler, an approval question — is not part of the answer.
+   * a filler, an approval question — is not part of the answer. Neither is
+   * audio the Director spoke *during* the answer, which is what `#asideMs`
+   * removes: `#answerFromMs` cannot see it, because it is already behind it.
    */
   #heardPrefix(heardMs: number): string {
     const text = this.#spoken.join(' ');
-    const answerMs = this.#enqueuedMs - this.#answerFromMs;
+    const answerMs = this.#enqueuedMs - this.#answerFromMs - this.#asideMs;
     if (!text || answerMs <= 0) return '';
 
-    const heardOfAnswer = Math.min(heardMs - this.#answerFromMs, answerMs);
+    // Asides and answer never overlap, and an aside always precedes the answer
+    // audio queued after it, so subtracting the total is exact whenever the
+    // asides were fully played. Barging in mid-aside overcounts slightly; the
+    // clamp below is what keeps that honest.
+    const heardOfAnswer = Math.min(heardMs - this.#answerFromMs - this.#asideMs, answerMs);
     if (heardOfAnswer <= 0) return '';
     if (heardOfAnswer >= answerMs) return text;
 
@@ -399,6 +415,7 @@ export class Director {
     // Provisional: #play moves it to where the answer's first frame actually
     // lands, so a filler played in between is not counted as answer.
     this.#answerFromMs = this.#enqueuedMs;
+    this.#asideMs = 0;
 
     const director = this;
     const sentences = (async function* () {
@@ -437,11 +454,13 @@ export class Director {
       if (!started) {
         started = true;
         this.#answerFromMs = this.#enqueuedMs;
+        // Everything the Director said up to here is already behind the mark.
+        this.#asideMs = 0;
         for (const sink of sinks) sink.onSpeechStart();
       }
       await this.#waitForRoom(signal, id);
       if (signal.aborted || this.#turnId !== id) break;
-      this.#emit(frame, sinks);
+      this.#emit(frame, sinks, 'answer');
     }
 
     if (started) for (const sink of sinks) sink.onSpeechEnd();
@@ -463,9 +482,15 @@ export class Director {
     }
   }
 
-  /** The one place audio reaches the speakers, so the one place it is counted. */
-  #emit(frame: AudioFrame, sinks: OutputSink[]): void {
-    this.#enqueuedMs += (frame.length / this.#deps.config.audio.deviceRate) * 1000;
+  /**
+   * The one place audio reaches the speakers, so the one place it is counted —
+   * and the one place that can tell the answer apart from the Director's own
+   * voice, which is why the caller has to say which it is.
+   */
+  #emit(frame: AudioFrame, sinks: OutputSink[], kind: 'answer' | 'aside'): void {
+    const ms = (frame.length / this.#deps.config.audio.deviceRate) * 1000;
+    this.#enqueuedMs += ms;
+    if (kind === 'aside') this.#asideMs += ms;
     this.#deps.audioOut.enqueue(frame);
     for (const sink of sinks) sink.onAudio(frame);
   }
@@ -484,7 +509,7 @@ export class Director {
       const source = await only(toSpokenForm(line));
       for await (const frame of this.#deps.voice.synthesize(source, controller.signal)) {
         if (controller.signal.aborted) break;
-        this.#emit(frame, sinks);
+        this.#emit(frame, sinks, 'aside');
       }
     } catch (error) {
       // A filler that fails is not worth killing the turn for, but it is worth
