@@ -60,16 +60,6 @@ const systemTimers: Timers = {
   clearTimeout: (handle) => clearTimeout(handle as NodeJS.Timeout),
 };
 
-/**
- * Rotated rather than picked at random: hearing the same filler twice in a row
- * is the single most robotic thing a voice assistant does.
- */
-const FILLERS = [
-  'Un attimo che guardo.',
-  'Aspetta un secondo.',
-  'Dammi un attimo che controllo.',
-];
-
 const GAVE_UP = 'Va bene, lascio stare. Non ho sentito la risposta.';
 const AUDIO_TROUBLE = 'Ho un problema con l’audio, controlla il microfono.';
 const TURN_FAILED = 'Scusa, qualcosa è andato storto. Riprova.';
@@ -142,8 +132,6 @@ export class Director {
   #tts: AbortController | undefined;
   /** The line the Director itself is speaking, if any. One at a time. */
   #line: AbortController | undefined;
-  #fillerTimer: unknown;
-  #fillerIndex = 0;
   /** Armed while a tool is running, re-armed after every line it speaks. */
   #progressTimer: unknown;
   /**
@@ -178,7 +166,7 @@ export class Director {
    * Audio the Director spoke on its own behalf since this answer began.
    *
    * `#answerFromMs` alone only excludes lines spoken *before* the first answer
-   * frame — a filler, an approval question. A line spoken while the answer is
+   * frame — an approval question. A line spoken while the answer is
    * already running, which is what narrating a tool call is, lands inside the
    * answer's stretch of the timeline and would otherwise inflate its measured
    * duration, skewing the prefix even though `#answerFromMs` never moved.
@@ -248,7 +236,6 @@ export class Director {
     for (const off of this.#unsubscribe.splice(0)) off();
     this.#turnId++;
     this.#tts?.abort();
-    this.#stopFiller();
     this.#stopProgress();
     this.#resolveApproval(false);
     // Nothing is coming back to drain this session's queue.
@@ -317,7 +304,6 @@ export class Director {
 
   async #bargeIn(): Promise<void> {
     this.#turnId++;
-    this.#stopFiller();
     this.#stopProgress();
     this.#tts?.abort();
     // A fresh utterance that barges in supersedes the turn it cut off — and
@@ -363,7 +349,7 @@ export class Director {
    * sentence-to-audio boundary to read and proportion by character count is the
    * honest approximation. It is clamped at both ends: audio that never left the
    * queue cannot have been heard, and audio enqueued before the answer began —
-   * a filler, an approval question — is not part of the answer. Neither is
+   * an approval question — is not part of the answer. Neither is
    * audio the Director spoke *during* the answer, which is what `#asideMs`
    * removes: `#answerFromMs` cannot see it, because it is already behind it.
    */
@@ -436,7 +422,6 @@ export class Director {
       if (isStopCommand(said)) {
         this.#turnId++;
         this.#tts?.abort();
-        this.#stopFiller();
         // "basta" said into a running search has to silence the search's own
         // narration too, or the cancelled turn keeps talking for three seconds.
         this.#stopProgress();
@@ -518,7 +503,6 @@ export class Director {
     // here, a barge-in's numbers further down have nothing to be numbers about.
     this.#debug(`turn: transcript=${JSON.stringify(text)}`);
     this.#setState('THINKING');
-    this.#startFiller();
     void this.#run(text);
   }
 
@@ -528,7 +512,7 @@ export class Director {
     this.#tts = tts;
     this.#spoken = [];
     // Provisional: #play moves it to where the answer's first frame actually
-    // lands, so a filler played in between is not counted as answer.
+    // lands, so an approval question played in between is not counted as answer.
     this.#answerFromMs = this.#enqueuedMs;
     this.#asideMs = 0;
     this.#asideSpans = [];
@@ -541,17 +525,8 @@ export class Director {
     // past and forward them unchanged: the filter needs a tool event to close
     // the text block it interrupts.
     const observed = (async function* () {
-      let seenToken = false;
       for await (const event of director.#deps.agent.send(text)) {
         if (director.#turnId !== id) return;
-        if (event.type === 'text' && event.delta.trim() && !seenToken) {
-          seenToken = true;
-          // The filler covers the wait for the FIRST TOKEN (spec §4). A long
-          // first sentence can trail its first token by seconds, and cancelling
-          // on the sentence is what made "aspetta un secondo" fire even while the
-          // answer was already on the way. The token is the real end of the wait.
-          director.#stopFiller();
-        }
         if (event.type === 'tool') {
           director.#debug(`tool: ${event.phase} ${event.name}`);
           if (event.phase === 'start') {
@@ -590,7 +565,6 @@ export class Director {
     }
 
     if (this.#turnId !== id) return;
-    this.#stopFiller();
     // A stream that ends inside a tool bracket — an interrupt, a crashed tool —
     // leaves the timer armed with nothing left to narrate.
     this.#stopProgress();
@@ -659,10 +633,10 @@ export class Director {
     for (const sink of sinks) sink.onAudio(frame);
   }
 
-  /** Speak one line the Director wrote itself: a filler, a question, an apology. */
+  /** Speak one line the Director wrote itself: a progress line, a question, an apology. */
   async #say(line: string): Promise<void> {
     const sinks = this.#deps.sinks ?? [];
-    // One at a time. Two of these overlapping — a filler running into an
+    // One at a time. Two of these overlapping — a progress line running into an
     // approval question, or two questions back to back — is not a degraded
     // answer, it is an unintelligible one.
     this.#line?.abort();
@@ -676,7 +650,7 @@ export class Director {
         this.#emit(frame, sinks, 'aside');
       }
     } catch (error) {
-      // A filler that fails is not worth killing the turn for, but it is worth
+      // A line that fails is not worth killing the turn for, but it is worth
       // saying out loud in the log — a voice that silently stops speaking is
       // indistinguishable from one that has nothing to say.
       this.#deps.onError?.(`voice: ${String(error)}`);
@@ -685,27 +659,8 @@ export class Director {
     }
   }
 
-  #startFiller(): void {
-    this.#stopFiller();
-    this.#fillerTimer = this.#timers.setTimeout(() => {
-      this.#fillerTimer = undefined;
-      // The first token may have landed while the timer was queued. Speaking
-      // now would be the agent talking over its own answer.
-      if (this.#state !== 'THINKING') return;
-      void this.#say(FILLERS[this.#fillerIndex++ % FILLERS.length]!);
-    }, this.#deps.config.director.fillerAfterMs);
-  }
-
-  /**
-   * Stop the filler whether it is still pending or already out loud. Cancelling
-   * only the timer leaves a filler that started a moment earlier talking over
-   * the answer it was covering for.
-   */
-  #stopFiller(): void {
-    if (this.#fillerTimer !== undefined) {
-      this.#timers.clearTimeout(this.#fillerTimer);
-      this.#fillerTimer = undefined;
-    }
+  /** Silence the line the Director itself is speaking, if one is out loud. */
+  #stopLine(): void {
     this.#line?.abort();
     this.#line = undefined;
   }
@@ -713,11 +668,8 @@ export class Director {
   /**
    * Narrate a tool call for as long as it runs.
    *
-   * The filler covers the wait for the first token and is cancelled by the
-   * first sentence; the tool then runs behind that sentence, covered by
-   * nothing. A web search is minutes of it — the silence that started this
-   * project. Unlike the filler this repeats, because the wait it is covering
-   * has no known length.
+   * A web search is minutes of silence — the silence that started this project.
+   * The line repeats, because the wait it is covering has no known length.
    */
   #startProgress(tool: string): void {
     this.#stopProgress();
@@ -745,17 +697,15 @@ export class Director {
   }
 
   /**
-   * Same reasoning as `#stopFiller`, and the same channel: a progress line
-   * already out loud has to be cut, not merely un-scheduled, or it talks over
-   * the answer that has just arrived to replace it.
+   * A progress line already out loud has to be cut, not merely un-scheduled, or
+   * it talks over the answer that has just arrived to replace it.
    */
   #stopProgress(): void {
     if (this.#progressTimer !== undefined) {
       this.#timers.clearTimeout(this.#progressTimer);
       this.#progressTimer = undefined;
     }
-    this.#line?.abort();
-    this.#line = undefined;
+    this.#stopLine();
   }
 
   // ----------------------------------------------------------------- approval
@@ -765,7 +715,6 @@ export class Director {
     // were already thinking about.
     const from = this.#state === 'AWAITING_APPROVAL' ? 'THINKING' : this.#state;
     this.#resolveApproval(false);
-    this.#stopFiller();
 
     return new Promise<boolean>((resolve) => {
       const timer = this.#timers.setTimeout(() => {
@@ -833,7 +782,6 @@ export class Director {
     this.#deps.onError?.(message);
     this.#turnId++;
     this.#tts?.abort();
-    this.#stopFiller();
     this.#stopProgress();
     this.#resolveApproval(false);
     // The turn that would have drained this is dead, and an apology is about

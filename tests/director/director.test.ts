@@ -449,7 +449,7 @@ test('the second barge-in is measured as carefully as the first', async () => {
   await director.stop();
 });
 
-test('a filler already speaking is cut off by the answer, not left to overlap', async () => {
+test('a progress line already speaking is cut off by the answer, not left to overlap', async () => {
   const f = makeFakes(config);
   const director = new Director(f.deps);
   await director.start();
@@ -458,14 +458,16 @@ test('a filler already speaking is cut off by the answer, not left to overlap', 
   f.transcriber.final('cerca sul web il meteo');
   f.turns.turnEnd();
   await f.tick();
+  f.agent.emitTool('WebSearch', 'start');
+  await f.tick();
 
-  // The filler starts speaking, and the first sentence lands while it is still
-  // going. Cancelling only the timer leaves the two talking over each other.
-  f.advance(config.director.fillerAfterMs + 10);
+  // The progress line starts speaking, and the first sentence lands while it is
+  // still going. Cancelling only the timer leaves the two talking over each other.
+  f.advance(3000);
   f.agent.emitText('A Valenza ci sono venti gradi.');
   await f.tick();
 
-  assert.equal(f.voice.aborts, 1, 'the filler must be silenced, not merely un-scheduled');
+  assert.ok(f.voice.aborts > 0, 'the narration must be silenced, not merely un-scheduled');
   assert.ok(f.voice.spoken.includes('A Valenza ci sono venti gradi.'));
 
   await director.stop();
@@ -683,27 +685,7 @@ test('a long answer waits for the speakers instead of overflowing the queue', as
   await director.stop();
 });
 
-test('filler is spoken when the first token is slow', async () => {
-  const f = makeFakes(config);
-  const director = new Director(f.deps);
-  await director.start();
-
-  f.turns.speechStart();
-  f.transcriber.final('cerca sul web il meteo');
-  f.turns.turnEnd();
-  await f.tick();
-
-  f.advance(config.director.fillerAfterMs + 10);
-  await f.tick();
-  assert.ok(
-    f.voice.spoken.some((s) => /guardo|aspetta|controllo/i.test(s)),
-    'only the Director can see silence while it happens (spec §4)',
-  );
-
-  await director.stop();
-});
-
-test('a fast first token means no filler at all', async () => {
+test('nothing is spoken into the wait for the first token', async () => {
   const f = makeFakes(config);
   const director = new Director(f.deps);
   await director.start();
@@ -711,44 +693,38 @@ test('a fast first token means no filler at all', async () => {
   f.turns.speechStart();
   f.transcriber.final('che ore sono');
   f.turns.turnEnd();
+  await f.tick();
+
+  // The wait for the first token used to be covered by a filler line ("un attimo
+  // che guardo"). It fired on nearly every turn — a long first sentence trails
+  // its first token by more than any timer — and being talked over is worse than
+  // a moment of silence. The Director says nothing it was not asked to say.
+  f.advance(10_000);
+  await f.tick();
+  assert.deepEqual(f.voice.spoken, [], 'silence while thinking, always');
+
+  await director.stop();
+});
+
+test('a slow first token is still silent once the answer arrives', async () => {
+  const f = makeFakes(config);
+  const director = new Director(f.deps);
+  await director.start();
+
+  f.turns.speechStart();
+  f.transcriber.final('che ore sono');
+  f.turns.turnEnd();
+  await f.tick();
+
+  f.advance(10_000);
   await f.tick();
   f.agent.emitText('Sono le tre.');
   await f.tick();
 
-  f.advance(config.director.fillerAfterMs + 10);
-  await f.tick();
   assert.deepEqual(
     f.voice.spoken,
     ['Sono le tre.'],
-    'a filler after the answer has started is the agent talking over itself',
-  );
-
-  await director.stop();
-});
-
-test('a first token with no sentence yet still silences the filler', async () => {
-  const f = makeFakes(config);
-  const director = new Director(f.deps);
-  await director.start();
-
-  f.turns.speechStart();
-  f.transcriber.final('che ore sono');
-  f.turns.turnEnd();
-  await f.tick();
-
-  // The first token lands well inside the filler window, but the sentence is not
-  // complete — no period, no newline — so the filter holds it back. The filler
-  // must still stay silent: the wait it covers is the one for the first token,
-  // and that token has arrived.
-  f.agent.emitDelta('Sono');
-  await f.tick();
-
-  f.advance(config.director.fillerAfterMs + 10);
-  await f.tick();
-  assert.deepEqual(
-    f.voice.spoken,
-    [],
-    'the first token ends the wait, even before the sentence is complete',
+    'the answer is the first thing the user hears from the Director',
   );
 
   await director.stop();

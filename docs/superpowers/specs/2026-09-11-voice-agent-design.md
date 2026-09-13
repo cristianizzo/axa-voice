@@ -285,15 +285,15 @@ Overlap is the rest of the design. Nothing waits for a complete answer:
 
 - The **first complete sentence** goes to TTS while Claude is still generating.
 - Sentence *n+1* synthesizes while sentence *n* plays, so playback never gaps.
-- If the first token has not arrived within **1200 ms** (typically because Claude is
-  running tools), the Director emits a filler line — "aspetta che guardo" — through the
-  same path. **Filler is a Director decision, not a Voice or Filter concern.**
-
-  The prototype proved why. Asked to check the weather, the model was instructed to
-  narrate before a slow tool call, and it did emit "aspetta che controllo" — but only
-  in the same burst as the finished answer, 15 s later. A model cannot announce that it
-  is thinking, because by the time it writes anything it has stopped. Only the Director
-  can see 1200 ms of silence while it happens.
+- **While waiting for the first token, the Director says nothing.** A filler line —
+  "aspetta che guardo" after 1200 ms — was implemented and then removed: it fired on
+  nearly every turn, because a long first sentence trails its first token by more than
+  any fixed timer, so the user was talked over mid-answer on an ordinary question.
+  Being interrupted is worse than a moment of silence. The prototype had already shown
+  the model cannot narrate its own thinking (it emits "aspetta che controllo" only in
+  the same burst as the finished answer, 15 s later), and a Director timer turned out
+  to be the wrong instrument too. Long waits are covered only where they are real and
+  namable: a tool call (§4, `progress.ts`), which the Director can see start and end.
 
 ## 5. Turn detection
 
@@ -731,7 +731,7 @@ components are also new is the worst possible trade.
 
   Stream deltas are emitted for the main session only — **subagent output arrives as
   whole messages**, so any turn that dispatches a subagent will speak in one late burst
-  unless the Director emits filler (§4).
+  rather than streaming (§4).
 - **Cartesia** for TTS over the WebSocket endpoint, `cartesia_version: 2026-08-14`.
   `sonic-3`, `sonic-3.5` and `sonic-3.6` are all live and measurably equal in latency
   (§4), so pick on voice quality; `sonic-2` and earlier return HTTP 400 "Model
