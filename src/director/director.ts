@@ -541,8 +541,17 @@ export class Director {
     // past and forward them unchanged: the filter needs a tool event to close
     // the text block it interrupts.
     const observed = (async function* () {
+      let seenToken = false;
       for await (const event of director.#deps.agent.send(text)) {
         if (director.#turnId !== id) return;
+        if (event.type === 'text' && event.delta.trim() && !seenToken) {
+          seenToken = true;
+          // The filler covers the wait for the FIRST TOKEN (spec §4). A long
+          // first sentence can trail its first token by seconds, and cancelling
+          // on the sentence is what made "aspetta un secondo" fire even while the
+          // answer was already on the way. The token is the real end of the wait.
+          director.#stopFiller();
+        }
         if (event.type === 'tool') {
           director.#debug(`tool: ${event.phase} ${event.name}`);
           if (event.phase === 'start') {
@@ -565,8 +574,7 @@ export class Director {
     const sentences = (async function* () {
       for await (const sentence of director.#deps.filter.filter(observed)) {
         if (director.#turnId !== id) return;
-        director.#stopFiller();
-        // The answer itself is now the thing covering the silence.
+        // Tool narration ends when the real answer starts speaking (spec §4).
         director.#stopProgress();
         director.#spoken.push(sentence);
         if (director.#state === 'THINKING') director.#setState('SPEAKING');

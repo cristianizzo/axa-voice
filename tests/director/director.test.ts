@@ -726,6 +726,34 @@ test('a fast first token means no filler at all', async () => {
   await director.stop();
 });
 
+test('a first token with no sentence yet still silences the filler', async () => {
+  const f = makeFakes(config);
+  const director = new Director(f.deps);
+  await director.start();
+
+  f.turns.speechStart();
+  f.transcriber.final('che ore sono');
+  f.turns.turnEnd();
+  await f.tick();
+
+  // The first token lands well inside the filler window, but the sentence is not
+  // complete — no period, no newline — so the filter holds it back. The filler
+  // must still stay silent: the wait it covers is the one for the first token,
+  // and that token has arrived.
+  f.agent.emitDelta('Sono');
+  await f.tick();
+
+  f.advance(config.director.fillerAfterMs + 10);
+  await f.tick();
+  assert.deepEqual(
+    f.voice.spoken,
+    [],
+    'the first token ends the wait, even before the sentence is complete',
+  );
+
+  await director.stop();
+});
+
 test('a write tool asks out loud and runs only on a spoken yes', async () => {
   const f = makeFakes(config);
   const director = new Director(f.deps);
