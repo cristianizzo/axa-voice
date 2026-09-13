@@ -265,6 +265,11 @@ class FakeAgentSession implements AgentSession {
     this.#push({ type: 'text', delta: '\n' });
   }
 
+  /** A bare delta, with no block-ending newline: a token mid-sentence. */
+  emitDelta(text: string): void {
+    this.#push({ type: 'text', delta: text });
+  }
+
   emitTool(name: string, phase: 'start' | 'end'): void {
     this.#push({ type: 'tool', name, phase });
   }
