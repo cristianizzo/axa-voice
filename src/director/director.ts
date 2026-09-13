@@ -569,7 +569,7 @@ export class Director {
         // The answer itself is now the thing covering the silence.
         director.#stopProgress();
         director.#spoken.push(sentence);
-        if (director.#state === 'THINKING') director.#state = 'SPEAKING';
+        if (director.#state === 'THINKING') director.#setState('SPEAKING');
         yield sentence;
       }
     })();
