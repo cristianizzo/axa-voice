@@ -1,3 +1,6 @@
 proto/models/
+models/
 node_modules/
 .env
+native/aecio
+.claude/worktrees/

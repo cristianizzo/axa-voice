@@ -6,8 +6,7 @@ A voice front-end for Claude that runs on your machine: you speak, it answers in
 second, and you can cut it off mid-sentence. It runs on open speakers — no headphones
 required — and it never reads code out loud.
 
-> **Status:** design approved and revised against a working throwaway prototype
-> (`proto/talk.mjs`). Real implementation not started.
+> **Status:** M1 implemented — `npm start` runs the real loop.
 > See [the design doc](docs/superpowers/specs/2026-09-11-voice-agent-design.md).
 
 ## Why
@@ -26,6 +25,8 @@ axa-voice targets exactly those three:
 | Time to first sound | ~2s | ~1.3s (measured, not estimated) |
 | Interrupt mid-answer | no | yes, silent within 50ms |
 | Knows where it got cut off | — | yes, it resumes from what you actually heard |
+| Talk while it is working | — | adds to the conversation instead of cancelling it; answered next |
+| During a long search | silence | says what it is doing, every few seconds |
 | Reads code aloud | — | never; code stays on screen |
 
 ## How it works
@@ -107,16 +108,77 @@ local whisper.cpp (STT) · macOS VoiceProcessingIO (capture + echo cancellation)
 Both the TTS and the STT sit behind one-method interfaces. ElevenLabs and Deepgram are
 drop-in alternatives.
 
-## Try the prototype
+## Run it
 
-`proto/talk.mjs` is a throwaway single file — no build, no dependencies — that proves the
-loop end to end. It is not the architecture; it is the measuring instrument that
-corrected it.
+macOS and Node 22.18+ (the source is TypeScript and runs unbuilt, via Node's type
+stripping).
+
+**1. whisper.cpp on your PATH.** `whisper-server` 1.9.2 or newer — earlier versions have
+no `--vad`, and without VAD whisper turns silence into confident sentences.
 
 ```sh
-cp .env.example .env      # add CARTESIA_API_KEY, or leave empty to use the macOS voice
-node proto/talk.mjs
+brew install whisper-cpp
 ```
+
+**2. Two models.** They are large and not in git, so this step is not optional.
+
+```sh
+mkdir -p models
+curl -L -o models/ggml-small.bin \
+  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin
+curl -L -o models/ggml-silero-v5.1.2.bin \
+  https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin
+```
+
+**3. The audio helper.** A small Swift binary around macOS VoiceProcessingIO — it is what
+stops the microphone from hearing the speakers. Needs the Xcode command-line tools.
+
+```sh
+npm install
+npm run build:native
+```
+
+**4. Your Cartesia key.**
+
+```sh
+cp .env.example .env      # add CARTESIA_API_KEY
+```
+
+Then:
+
+```sh
+npm start
+```
+
+The first run asks for microphone access. Say something; it answers out loud. Cut it off
+mid-sentence and it stops within 50ms and picks up from what you actually heard. Ask it to
+write a file and it asks you out loud first — anything it does not clearly hear as a yes
+counts as a no.
+
+## Tests
+
+```sh
+npm test            # 165 unit tests, no hardware, no network, no money
+npm run typecheck
+```
+
+Four tests are skipped by default because they touch the real world:
+
+```sh
+AXA_LIVE=1 npm test   # real Claude session, real Cartesia, real speakers
+```
+
+- `tests/integration/latency.test.ts` measures end-to-end time to first audio and fails
+  above 1300ms. It discards turn 1: that one pays process spawn and system-prompt
+  processing, measures ~7s, and reporting it would send someone optimising something that
+  was never slow.
+- `tests/integration/echo.test.ts` plays 3s of speech out of the speakers with the
+  microphone open and asserts the transcript is empty. **Do not run it with headphones on**
+  — headphones hide exactly the bug it exists to catch.
+- `tests/audio/helper.test.ts` drives the native helper: it opens the real microphone,
+  so it asks first rather than doing it behind a plain `npm test`.
+
+`AXA_DEBUG=1 npm start` prints the turn trace.
 
 ## Docs
 
