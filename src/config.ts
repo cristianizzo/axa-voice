@@ -13,7 +13,7 @@ export interface Config {
   };
   readonly turn: { silenceMs: number; unfinishedSilenceMs: number; stablePrefixDropTokens: number };
   readonly voice: { model: string; voiceId: string; apiVersion: string; language: string };
-  readonly director: { fillerAfterMs: number; approvalTimeoutMs: number };
+  readonly director: { approvalTimeoutMs: number };
   readonly readOnlyTools: readonly string[];
   /** Non-enumerable on purpose: keeps the secret out of logs and crash dumps. */
   cartesiaKey(): string;
@@ -50,7 +50,7 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
       apiVersion: '2026-08-14',
       language: 'it',
     },
-    director: { fillerAfterMs: 1200, approvalTimeoutMs: 10000 },
+    director: { approvalTimeoutMs: 10000 },
     readOnlyTools: ['Read', 'Glob', 'Grep', 'WebSearch', 'WebFetch', 'ToolSearch'] as const,
   };
 

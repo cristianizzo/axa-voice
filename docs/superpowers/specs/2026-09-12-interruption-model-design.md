@@ -17,9 +17,9 @@ USER:      [L'utente ti ha interrotto. Ha sentito solo: ""] Ha detto: Allora
 
 Three separate defects, in one exchange:
 
-1. **Silence for minutes during a tool call.** The filler covers only the wait for the
-   first token and is stopped by the first sentence. `WebSearch` runs after that, covered
-   by nothing.
+1. **Silence for minutes during a tool call.** Nothing covers a running tool:
+   `WebSearch` runs after the first sentence, covered by nothing. (The filler, since
+   removed, only ever covered the wait for the first token.)
 2. **The user's prompt killed the work.** Hearing silence, the user said *"Allora"*. That
    was treated as barge-in and cancelled the search — the one thing being waited for.
    This repeated: the second attempt was cancelled the same way.
@@ -118,7 +118,7 @@ On `phase: 'start'`, speak a line every **3 s** drawn from a tool-to-Italian map
 previous line. On `phase: 'end'`, or on the first sentence of the real answer, stop.
 
 §7 still governs: name the **action**, never the path or the arguments. A progress line
-is the same kind of speech as a filler and is subject to the same rule.
+is Director speech the user did not ask for, and is subject to the same rule.
 
 These lines must not enter `#spoken` or move `#answerFromMs`. They are not part of the
 answer, and counting them would corrupt the interruption note — which is defect 3.

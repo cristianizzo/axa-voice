@@ -19,7 +19,6 @@ test('loadConfig exposes the measured constants from spec §4', () => {
   assert.equal(c.turn.unfinishedSilenceMs, 700);
   assert.equal(c.stt.partialCadenceMs, 350);
   assert.equal(c.stt.partialAudioCtx, 1000);
-  assert.equal(c.director.fillerAfterMs, 1200);
   assert.equal(c.director.approvalTimeoutMs, 10000);
 });
 
