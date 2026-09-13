@@ -801,7 +801,12 @@ export class Director {
   }
 
   async #redispatch(text: string): Promise<void> {
+    // interrupt() is an await, and a barge-in, an audio failure or stop() can all
+    // land inside it. Starting a turn out of whatever state that left behind
+    // would answer a question the user never asked.
+    const id = this.#turnId;
     await this.#deps.agent.interrupt();
+    if (this.#turnId !== id) return;
     this.#ask(text);
   }
 

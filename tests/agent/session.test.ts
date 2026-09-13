@@ -218,7 +218,7 @@ test('text deltas become AgentEvents', async () => {
             type: 'stream_event',
             event: { type: 'content_block_delta', delta: { type: 'text_delta', text: ' mondo' } },
           };
-          yield { type: 'result' };
+          yield { type: 'result', subtype: 'success' };
         })(),
       close: () => {},
     })) as never,
@@ -344,6 +344,20 @@ test('the turn ends with done', async () => {
     { type: 'text', delta: 'Ciao.' },
     { type: 'done' },
   ]);
+  await session.close();
+});
+
+test('a genuine error result surfaces instead of ending the turn as done', async () => {
+  // An interrupted turn's result is an error too, and must NOT throw — that is
+  // the expected end of a turn we cut. But an error the caller did not ask for
+  // (budget, max turns, a crashed tool) must surface, or the user hears silence
+  // where an apology belongs.
+  const sdk = makeFakeSdk();
+  const session = await startSession(sdk);
+  const events = drain(session.send('fai qualcosa'));
+  await settle();
+  sdk.emit({ type: 'result', subtype: 'error_max_turns', is_error: true });
+  await assert.rejects(() => events, /error_max_turns/);
   await session.close();
 });
 

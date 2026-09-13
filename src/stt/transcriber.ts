@@ -97,15 +97,37 @@ class WhisperStream implements TranscriptionStream {
     // partial that never comes back must not take the turn down with it.
     const until = Date.now() + CLOSE_WAIT_MS;
     while (this.#busy && Date.now() < until) await new Promise((r) => setTimeout(r, 10));
-    const text = await this.#transcribe(0);
+    const text = await this.#final();
     if (text) for (const handler of this.#finalHandlers) handler(text);
+  }
+
+  /**
+   * The final transcription is the one that must not be lost. A dropped partial
+   * is recoverable — the next tick sends the same buffered audio — but the final
+   * has no next tick. Retry until it lands or the budget is spent; after that,
+   * `''` keeps close() from throwing, which would reject the Director's turn end.
+   */
+  async #final(): Promise<string> {
+    const deadline = Date.now() + REQUEST_TIMEOUT_MS;
+    for (;;) {
+      try {
+        return await this.#transcribe(0);
+      } catch {
+        if (Date.now() >= deadline) return '';
+        await new Promise((r) => setTimeout(r, 250));
+      }
+    }
   }
 
   async #tick(): Promise<void> {
     if (this.#busy || this.#closed || !this.#samples.length) return;
-    const text = await this.#transcribe(this.#config.stt.partialAudioCtx);
-    if (text && !this.#closed) {
-      for (const handler of this.#partialHandlers) handler(text);
+    try {
+      const text = await this.#transcribe(this.#config.stt.partialAudioCtx);
+      if (text && !this.#closed) {
+        for (const handler of this.#partialHandlers) handler(text);
+      }
+    } catch {
+      // A dropped partial is recoverable: the next tick sends the same audio.
     }
   }
 
@@ -131,11 +153,6 @@ class WhisperStream implements TranscriptionStream {
       });
       if (!res.ok) return '';
       return clean(await res.text());
-    } catch {
-      // A dropped partial is recoverable — the next tick sees the same audio.
-      // The final transcription is the one that must not be lost, and close()
-      // issues it separately.
-      return '';
     } finally {
       this.#busy = false;
     }

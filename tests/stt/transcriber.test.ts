@@ -80,3 +80,24 @@ test('a failed partial does not kill the stream', async () => {
 
   assert.deepEqual(finals, ['ciao'], 'one dropped partial must not lose the turn');
 });
+
+test('a dropped final transcription is retried, not lost', async () => {
+  let finals = 0;
+  const fetchFn = async (_url: string, init?: RequestInit) => {
+    const form = init!.body as FormData;
+    if (form.get('audio_ctx') === '0') {
+      finals += 1;
+      if (finals === 1) throw new Error('connection reset');
+    }
+    return new Response('ciao');
+  };
+  const t = new WhisperTranscriber(config, { fetchFn: fetchFn as never });
+  const stream = await t.open();
+  const heard: string[] = [];
+  stream.onFinal((text) => heard.push(text));
+  for (let i = 0; i < 60; i++) stream.push(frame());
+  await new Promise((r) => setTimeout(r, 450));
+  await stream.close();
+
+  assert.deepEqual(heard, ['ciao'], 'the final transcript must survive a transient failure');
+});

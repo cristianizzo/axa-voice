@@ -67,6 +67,8 @@ interface Turn {
   error: unknown;
   settled: Promise<void>;
   markSettled: () => void;
+  /** True once interrupt() has been called for this turn. */
+  interrupted: boolean;
 }
 
 function createTurn(): Turn {
@@ -74,7 +76,15 @@ function createTurn(): Turn {
   const settled = new Promise<void>((resolve) => {
     markSettled = resolve;
   });
-  return { events: [], wake: undefined, ended: false, error: undefined, settled, markSettled };
+  return {
+    events: [],
+    wake: undefined,
+    ended: false,
+    error: undefined,
+    settled,
+    markSettled,
+    interrupted: false,
+  };
 }
 
 /**
@@ -237,8 +247,20 @@ export class ClaudeAgentSession implements AgentSession {
 
     if (message.type === 'result') {
       if (this.#takeStaleResult()) return;
-      this.#emit({ type: 'done' });
-      this.#endTurn();
+      const turn = this.#turn;
+      if (message.subtype === 'success' && !message.is_error) {
+        this.#emit({ type: 'done' });
+        this.#endTurn();
+        return;
+      }
+      if (turn?.interrupted) {
+        // The result a turn we cut still owed: expected, not a failure. The CLI
+        // reports an interrupted turn as error_during_execution.
+        this.#emit({ type: 'done' });
+        this.#endTurn();
+        return;
+      }
+      this.#failTurn(new Error(`Claude ended the turn with an error (${message.subtype})`));
     }
   }
 
@@ -341,6 +363,10 @@ export class ClaudeAgentSession implements AgentSession {
 
   async interrupt(): Promise<void> {
     const turn = this.#turn;
+    // Mark the turn before the interrupt fires: the result the CLI emits for it
+    // is an error (error_during_execution), and must read as the expected end of
+    // a turn we cut, not as a genuine failure to surface to the caller.
+    if (turn && !turn.ended) turn.interrupted = true;
     // NOT abort: aborting tears the session down and takes ~2 s (spec §6).
     await this.#query?.interrupt();
     if (!turn || turn.ended) return;

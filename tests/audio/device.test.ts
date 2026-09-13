@@ -128,6 +128,23 @@ test('helper errors surface to onError rather than being swallowed', async () =>
   assert.match(errors[0]!, /digital silence/);
 });
 
+test('a helper that dies mid-flush resolves the flush instead of hanging', async () => {
+  const proc = fakeHelper();
+  const device = new AudioDevice(config, { spawnFn: (() => proc) as never });
+  const started = device.start();
+  proc.stderr.write('{"type":"ready","rate":24000,"micRate":16000}\n');
+  await started;
+
+  const errors: string[] = [];
+  device.onError((m) => errors.push(m));
+
+  const pending = device.flush();
+  proc.emit('exit', 1, null); // dies without ever acking the flush
+
+  assert.deepEqual(await pending, { heardMs: 0 });
+  assert.equal(errors.length, 1, 'the death is still reported');
+});
+
 test('a crashed helper rejects start rather than hanging forever', async () => {
   const proc = fakeHelper();
   const device = new AudioDevice(config, { spawnFn: (() => proc) as never });

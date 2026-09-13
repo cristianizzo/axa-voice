@@ -133,8 +133,10 @@ export class AudioDevice implements AudioInput, AudioOutput {
     this.#proc = undefined;
     this.#playingUntil = 0;
     await new Promise<void>((resolve) => {
+      // Graceful 'Q' first; if the helper will not quit, SIGKILL it — a stuck
+      // helper holding the microphone must not survive stop() (spec §9).
       const timer = setTimeout(() => {
-        proc.kill();
+        proc.kill('SIGKILL');
         resolve();
       }, STOP_GRACE_MS);
       proc.once('exit', () => {
@@ -215,6 +217,11 @@ export class AudioDevice implements AudioInput, AudioOutput {
   }
 
   #fail(message: string): void {
+    // Settle every pending flush: the caller is awaiting flush(), and a helper
+    // that died without acknowledging it would otherwise leave that await
+    // hanging for ever (spec §9). There is no helper left to report heardMs, so
+    // 0 is the honest answer — nothing more will ever reach the speakers.
+    this.#resolveFlushes(Number.MAX_SAFE_INTEGER, 0);
     for (const handler of this.#errorHandlers) handler(message);
   }
 }
