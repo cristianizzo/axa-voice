@@ -6,6 +6,21 @@ import type { Config } from '../config.ts';
 const VAD_MODEL_URL =
   'https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin';
 
+/**
+ * whisper-server's own defaults are greedy decoding (`beam-size -1`, `best-of 2`)
+ * — the mode most prone to inventing a plausible-sounding wrong word instead of
+ * surfacing a low-confidence one. Measured live 2026-09-23/24: short, clean,
+ * close-mic Italian utterances still came back as fluent nonsense ("angliici",
+ * "prisa", "bascio") — words that don't exist but scan grammatically, the exact
+ * signature of a decoder that had no alternative candidate to fall back to.
+ * Beam search with several candidates is the standard fix (~20-30% WER
+ * reduction over greedy per whisper.cpp community reports); the cost is more
+ * compute per request, cheap here since these clips run a few seconds on
+ * Metal.
+ */
+const BEAM_SIZE = 5;
+const BEST_OF = 5;
+
 async function portIsFree(port: number): Promise<boolean> {
   return new Promise((resolve) => {
     const socket = createConnection({ port, host: '127.0.0.1' })
@@ -64,6 +79,8 @@ export class WhisperServer {
         '-l', language,
         '--vad',
         '--vad-model', vadModelPath,
+        '-bs', String(BEAM_SIZE),
+        '-bo', String(BEST_OF),
       ],
       { stdio: ['ignore', 'ignore', 'pipe'] },
     );

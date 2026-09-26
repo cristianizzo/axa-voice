@@ -1,3 +1,5 @@
+import { mkdir, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import type {
   AudioFrame, Transcriber, TranscriptionStream, Unsubscribe,
 } from '../types.ts';
@@ -40,23 +42,52 @@ export function encodeWav(samples: Int16Array, rate: number): Buffer<ArrayBuffer
 const REQUEST_TIMEOUT_MS = 10_000;
 const CLOSE_WAIT_MS = 2_000;
 
+/**
+ * Silence gate for whisper.cpp's YouTube-subtitle hallucinations. Switching
+ * stt.modelPath to large-v3-turbo (src/config.ts) made the model confidently
+ * invent sign-off phrases (e.g. "Grazie a tutti") over near-silent/room-tone
+ * audio instead of returning nothing. clean.ts catches known phrasings, but a
+ * silence gate on the raw samples is a second, model-agnostic line of defense.
+ *
+ * Measured on real debug-audio dumps (2026-09-26, AXA_DEBUG=1 captures):
+ *   - hallucinated/near-silent segments: RMS 172-388
+ *   - real speech utterances this session: RMS 1133-4583
+ * 600 sits with a comfortable margin above the hallucination band and well
+ * below the real-speech band. Leaning low is deliberate: clean.ts's own
+ * comment is clear that quiet-but-real short answers ("sì"/"no"/"ferma", the
+ * whole approval vocabulary of spec §8) must never be silently swallowed, so
+ * it is safer to occasionally let a quiet hallucination through to clean.ts's
+ * phrase filter than to risk dropping a real short answer here.
+ */
+const SILENCE_RMS_THRESHOLD = 600;
+
+function rms(samples: readonly number[]): number {
+  if (!samples.length) return 0;
+  let sumSquares = 0;
+  for (const sample of samples) sumSquares += sample * sample;
+  return Math.sqrt(sumSquares / samples.length);
+}
+
 export class WhisperTranscriber implements Transcriber {
   readonly #config: Config;
   readonly #fetchFn: typeof fetch;
+  readonly #dumpDir: string | undefined;
 
-  constructor(config: Config, opts: { fetchFn?: typeof fetch } = {}) {
+  constructor(config: Config, opts: { fetchFn?: typeof fetch; dumpDir?: string } = {}) {
     this.#config = config;
     this.#fetchFn = opts.fetchFn ?? fetch;
+    this.#dumpDir = opts.dumpDir;
   }
 
   async open(): Promise<TranscriptionStream> {
-    return new WhisperStream(this.#config, this.#fetchFn);
+    return new WhisperStream(this.#config, this.#fetchFn, this.#dumpDir);
   }
 }
 
 class WhisperStream implements TranscriptionStream {
   readonly #config: Config;
   readonly #fetchFn: typeof fetch;
+  readonly #dumpDir: string | undefined;
   readonly #partialHandlers = new Set<(t: string) => void>();
   readonly #finalHandlers = new Set<(t: string) => void>();
   #samples: number[] = [];
@@ -64,9 +95,10 @@ class WhisperStream implements TranscriptionStream {
   #busy = false;
   #closed = false;
 
-  constructor(config: Config, fetchFn: typeof fetch) {
+  constructor(config: Config, fetchFn: typeof fetch, dumpDir: string | undefined) {
     this.#config = config;
     this.#fetchFn = fetchFn;
+    this.#dumpDir = dumpDir;
     this.#timer = setInterval(() => void this.#tick(), config.stt.partialCadenceMs);
     // The partial loop must never hold the process open on its own: the Director
     // owns the lifetime, close() is what stops it.
@@ -133,6 +165,11 @@ class WhisperStream implements TranscriptionStream {
 
   async #transcribe(audioCtx: number): Promise<string> {
     if (!this.#samples.length) return '';
+    // Below this, it's room tone/background noise, not speech: skip the
+    // network round trip entirely rather than hand whisper-server something
+    // it is prone to hallucinate a confident sign-off over (see
+    // SILENCE_RMS_THRESHOLD above).
+    if (rms(this.#samples) < SILENCE_RMS_THRESHOLD) return '';
     this.#busy = true;
     try {
       const { port, language } = this.#config.stt;
@@ -151,10 +188,39 @@ class WhisperStream implements TranscriptionStream {
         // later tick and close() then waits on a partial that will never land.
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
-      if (!res.ok) return '';
-      return clean(await res.text());
+      if (!res.ok) {
+        // The final is the one #final() retries on ANY throw, not just a
+        // non-ok response — mirror that here so a dump exists for a request
+        // whisper rejected outright, not only ones it mistranscribed.
+        void this.#dump(audioCtx, wav, '');
+        return '';
+      }
+      const text = clean(await res.text());
+      void this.#dump(audioCtx, wav, text);
+      return text;
     } finally {
       this.#busy = false;
+    }
+  }
+
+  /**
+   * Exists to catch the live-only bug a static-fixture test cannot reproduce
+   * (2026-09-23: whisper produced garbled English for live Italian speech, but
+   * transcribed a saved fixture correctly regardless of language). Only the
+   * final transcription (`audioCtx === 0`) is dumped — partials fire every
+   * `partialCadenceMs` and would flood the directory for no diagnostic gain.
+   * Fire-and-forget and errors are swallowed: a full disk or missing directory
+   * must not turn a debug aid into a reason the turn itself fails.
+   */
+  async #dump(audioCtx: number, wav: Buffer, text: string): Promise<void> {
+    if (!this.#dumpDir || audioCtx !== 0) return;
+    try {
+      await mkdir(this.#dumpDir, { recursive: true });
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      await writeFile(join(this.#dumpDir, `${stamp}.wav`), wav);
+      await writeFile(join(this.#dumpDir, `${stamp}.txt`), text);
+    } catch {
+      // Diagnostic aid only — never let it be the reason a turn fails.
     }
   }
 }

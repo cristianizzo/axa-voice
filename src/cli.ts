@@ -43,7 +43,13 @@ const director = new Director({
   config,
   audioIn: device,
   audioOut: device,
-  transcriber: new WhisperTranscriber(config),
+  // Dumps the exact audio sent for each turn's final transcription, so a live
+  // mistranscription can be replayed offline instead of guessed at (spec: the
+  // 2026-09-23 garbled-English report, which an isolated fixture test could
+  // not reproduce).
+  transcriber: new WhisperTranscriber(config, {
+    dumpDir: process.env.AXA_DEBUG ? new URL('../debug-audio/', import.meta.url).pathname : undefined,
+  }),
   turns: new VadTurnDetector(config),
   agent,
   voice,

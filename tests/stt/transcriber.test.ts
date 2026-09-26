@@ -4,7 +4,10 @@ import { WhisperTranscriber, encodeWav } from '../../src/stt/transcriber.ts';
 import { loadConfig } from '../../src/config.ts';
 
 const config = loadConfig({ CARTESIA_API_KEY: 'sk_test' });
-const frame = (fill = 1) => Int16Array.from({ length: 320 }, () => fill);
+// 2000 sits comfortably above the RMS silence gate in transcriber.ts (600) so
+// that these tests exercise the fetch path exactly as they did before that
+// gate existed; the gate itself is covered by the dedicated tests below.
+const frame = (fill = 2000) => Int16Array.from({ length: 320 }, () => fill);
 
 test('encodeWav writes a RIFF header whisper-server will accept', () => {
   const wav = encodeWav(new Int16Array(160), 16000);
@@ -100,4 +103,40 @@ test('a dropped final transcription is retried, not lost', async () => {
   await stream.close();
 
   assert.deepEqual(heard, ['ciao'], 'the final transcript must survive a transient failure');
+});
+
+test('near-silent audio is gated before it ever reaches whisper-server', async () => {
+  let calls = 0;
+  const fetchFn = async () => {
+    calls += 1;
+    return new Response('Grazie a tutti');
+  };
+  const t = new WhisperTranscriber(config, { fetchFn: fetchFn as never });
+  const stream = await t.open();
+  const finals: string[] = [];
+  stream.onFinal((text) => finals.push(text));
+  for (let i = 0; i < 60; i++) stream.push(frame(1));
+  await new Promise((r) => setTimeout(r, 450));
+  await stream.close();
+
+  assert.equal(calls, 0, 'room tone must never be sent to whisper-server');
+  assert.deepEqual(finals, [], 'a gated final must not surface an empty/hallucinated turn');
+});
+
+test('normal-amplitude audio still reaches whisper-server', async () => {
+  let calls = 0;
+  const fetchFn = async () => {
+    calls += 1;
+    return new Response('ciao');
+  };
+  const t = new WhisperTranscriber(config, { fetchFn: fetchFn as never });
+  const stream = await t.open();
+  const finals: string[] = [];
+  stream.onFinal((text) => finals.push(text));
+  for (let i = 0; i < 60; i++) stream.push(frame());
+  await new Promise((r) => setTimeout(r, 450));
+  await stream.close();
+
+  assert.ok(calls > 0, 'real-amplitude audio must not be silenced by the RMS gate');
+  assert.deepEqual(finals, ['ciao']);
 });

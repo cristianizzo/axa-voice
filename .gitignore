@@ -5,3 +5,4 @@ node_modules/
 native/aecio
 .claude/worktrees/
 .superpowers/
+debug-audio/
