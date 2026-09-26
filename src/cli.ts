@@ -1,4 +1,5 @@
 import { access, constants } from 'node:fs/promises';
+import { emitKeypressEvents } from 'node:readline';
 import { loadConfig } from './config.ts';
 import { AudioDevice } from './audio/device.ts';
 import { WhisperServer } from './stt/server.ts';
@@ -86,7 +87,28 @@ try {
   await agent.start(); // ~900ms, must not land on the first turn (spec §4)
   console.log('apro il microfono…');
   await director.start();
-  console.log('pronto. parla pure.  (ctrl-c per uscire)');
+  console.log('pronto. parla pure.  (ctrl-c per uscire, barra spaziatrice per silenziare)');
+
+  // Manual mic mute: a background tool call can run long enough that a nearby
+  // conversation not meant for Axa gets treated as a follow-up, and the mic
+  // itself is the only thing that can reliably say "not talking to you" while
+  // the agent is busy. Keypress, not a spoken command, on purpose — it must
+  // not depend on the very channel it is meant to silence.
+  if (process.stdin.isTTY) {
+    emitKeypressEvents(process.stdin);
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+    // Raw mode stops the terminal from turning Ctrl-C into SIGINT itself, so
+    // the existing shutdown path has to be re-armed here or the app becomes
+    // unkillable the moment muting is available.
+    process.stdin.on('keypress', (_str, key: { name?: string; ctrl?: boolean } | undefined) => {
+      if (key?.ctrl && key.name === 'c') {
+        void shutdown(0);
+        return;
+      }
+      if (key?.name === 'space') director.setMuted(!director.muted);
+    });
+  }
 } catch (error) {
   console.error(`\nnon riesco a partire: ${(error as Error).message}\n`);
   await shutdown(1);

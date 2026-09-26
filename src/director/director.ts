@@ -138,6 +138,14 @@ export class Director {
   /** Armed while a tool is running, re-armed after every line it speaks. */
   #progressTimer: unknown;
   /**
+   * Armed for the whole turn, not just a tool call: progress narration covers
+   * a slow tool, but nothing covered a stream that stops producing events
+   * entirely (a genuinely hung network call inside the agent). Cleared on
+   * every path out of `#run` — success, interrupt, stop-word — so it never
+   * fires against a turn that already finished on its own.
+   */
+  #turnTimer: unknown;
+  /**
    * How many tool calls are outstanding right now, this turn.
    *
    * Claude routinely fires tools in parallel — `session.ts` brackets each
@@ -189,6 +197,15 @@ export class Director {
   /** What the user heard before cutting in, waiting for what they say next. */
   #pendingNote: string | undefined;
 
+  /**
+   * True when the user has explicitly silenced the mic (spacebar in cli.ts).
+   * A background tool call can run long enough that a nearby conversation not
+   * meant for Axa gets treated as a follow-up — this is the escape hatch, and
+   * it has to be instant: gating `#onFrame` before the turn detector ever sees
+   * a frame, rather than after, so a muted room produces no onset at all.
+   */
+  #muted = false;
+
   #approval:
     | { resolve: (value: boolean) => void; from: DirectorState; timer: unknown }
     | undefined;
@@ -200,6 +217,26 @@ export class Director {
 
   get state(): DirectorState {
     return this.#state;
+  }
+
+  get muted(): boolean {
+    return this.#muted;
+  }
+
+  /**
+   * Toggle the mic on/off. Muting cancels whatever utterance is mid-capture
+   * rather than letting it finish — the whole point is an instant off switch,
+   * not one that waits out a turn already in flight.
+   */
+  setMuted(muted: boolean): void {
+    if (this.#muted === muted) return;
+    this.#muted = muted;
+    if (muted) {
+      this.#capturing = false;
+      this.#capturingFrom = null;
+      if (this.#state === 'HEARING') this.#setState('LISTENING');
+    }
+    void this.#say(muted ? 'Microfono disattivato.' : 'Microfono riattivato.');
   }
 
   /** No-op unless a `debug` dep was injected — never a bare `console.log` here. */
@@ -240,6 +277,7 @@ export class Director {
     this.#turnId++;
     this.#tts?.abort();
     this.#stopProgress();
+    this.#stopTurnTimer();
     this.#resolveApproval(false);
     // Nothing is coming back to drain this session's queue.
     this.#queued = [];
@@ -274,6 +312,9 @@ export class Director {
   }
 
   #onFrame(frame: AudioFrame): void {
+    // Muted means invisible, not just unheard: the detector never even sees the
+    // frame, so a muted room cannot produce a speech onset in the first place.
+    if (this.#muted) return;
     // The detector first: it may turn this very frame into a speech onset, and
     // the frame that crossed the threshold is one whisper needs.
     this.#deps.turns.push(frame, this.#lastPartial);
@@ -308,6 +349,7 @@ export class Director {
   async #bargeIn(): Promise<void> {
     this.#turnId++;
     this.#stopProgress();
+    this.#stopTurnTimer();
     this.#tts?.abort();
     // A fresh utterance that barges in supersedes the turn it cut off — and
     // anything that turn had queued from an earlier follow-up. Keeping it
@@ -335,7 +377,7 @@ export class Director {
     this.#enqueuedMs = heardMs;
 
     // interrupt(), not abort(): aborting tears the session down and costs ~2s.
-    await this.#deps.agent.interrupt();
+    await this.#interrupt();
   }
 
   /**
@@ -428,6 +470,7 @@ export class Director {
         // "basta" said into a running search has to silence the search's own
         // narration too, or the cancelled turn keeps talking for three seconds.
         this.#stopProgress();
+        this.#stopTurnTimer();
         // A permission request can have arrived inside the await above without
         // bumping #turnId. Leaving it unresolved strands the SDK's canUseTool
         // promise with its timer armed, and approvalTimeoutMs later it speaks
@@ -528,6 +571,7 @@ export class Director {
     this.#asideMs = 0;
     this.#asideSpans = [];
     this.#toolsRunning = 0;
+    this.#armTurnTimer(id);
 
     const director = this;
     // The filter eats the whole event stream and yields only sentences, so the
@@ -579,6 +623,7 @@ export class Director {
     // A stream that ends inside a tool bracket — an interrupt, a crashed tool —
     // leaves the timer armed with nothing left to narrate.
     this.#stopProgress();
+    this.#stopTurnTimer();
     this.#setState('LISTENING');
 
     // Said while the answer was in flight. It was deliberately not allowed to
@@ -719,6 +764,29 @@ export class Director {
     this.#stopLine();
   }
 
+  /**
+   * The hard backstop for a turn whose stream never produces another event —
+   * a genuinely hung network call inside the agent's tool, not merely a slow
+   * one. Progress narration already covers the slow case; this covers "never".
+   */
+  #armTurnTimer(id: number): void {
+    this.#turnTimer = this.#timers.setTimeout(() => {
+      this.#turnTimer = undefined;
+      if (this.#turnId !== id) return;
+      this.#abandon(
+        `turn timed out after ${this.#deps.config.director.turnTimeoutMs}ms with no answer`,
+        TURN_FAILED,
+      );
+    }, this.#deps.config.director.turnTimeoutMs);
+  }
+
+  #stopTurnTimer(): void {
+    if (this.#turnTimer !== undefined) {
+      this.#timers.clearTimeout(this.#turnTimer);
+      this.#turnTimer = undefined;
+    }
+  }
+
   // ----------------------------------------------------------------- approval
 
   #onPermission(req: PermissionRequest): Promise<boolean> {
@@ -773,9 +841,27 @@ export class Director {
     // land inside it. Starting a turn out of whatever state that left behind
     // would answer a question the user never asked.
     const id = this.#turnId;
-    await this.#deps.agent.interrupt();
+    await this.#interrupt();
     if (this.#turnId !== id) return;
     this.#ask(text);
+  }
+
+  /**
+   * Bounded wrapper around `agent.interrupt()`. Both callers above await it
+   * directly, outside `#run`, so `#turnTimer` cannot cover a hang here — and
+   * the SDK gives no guarantee interrupt() returns promptly while a
+   * background subagent Task is still working (spec: 2026-09-26, a barge-in
+   * that froze the whole app because interrupt() never came back). Racing a
+   * timer against it bounds the cost of a slow interrupt to one timeout
+   * instead of the rest of the session.
+   */
+  async #interrupt(): Promise<void> {
+    let timer: unknown;
+    const timeout = new Promise<void>((resolve) => {
+      timer = this.#timers.setTimeout(resolve, this.#deps.config.director.interruptTimeoutMs);
+    });
+    await Promise.race([this.#deps.agent.interrupt(), timeout]);
+    this.#timers.clearTimeout(timer);
   }
 
   #resolveApproval(value: boolean): void {
@@ -794,6 +880,7 @@ export class Director {
     this.#turnId++;
     this.#tts?.abort();
     this.#stopProgress();
+    this.#stopTurnTimer();
     this.#resolveApproval(false);
     // The turn that would have drained this is dead, and an apology is about
     // to be spoken in its place — nothing queued against it belongs after that.

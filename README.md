@@ -124,8 +124,8 @@ brew install whisper-cpp
 
 ```sh
 mkdir -p models
-curl -L -o models/ggml-small.bin \
-  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin
+curl -L -o models/ggml-large-v3-turbo.bin \
+  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin
 curl -L -o models/ggml-silero-v5.1.2.bin \
   https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin
 ```

@@ -1024,3 +1024,68 @@ test('a debug hook receives the turn trace: transcript, state, tool, and the bar
     assert.ok(bargeIn!.includes(field), `barge-in line is missing ${field}`);
   }
 });
+
+test('muting stops a frame from ever reaching the turn detector', async () => {
+  const f = makeFakes(config);
+  const d = new Director(f.deps);
+  await d.start();
+
+  d.setMuted(true);
+  assert.equal(d.muted, true);
+  f.audioIn.frame();
+  assert.equal(f.turns.pushed.length, 0, 'a muted room produces no onset at all');
+
+  d.setMuted(false);
+  f.audioIn.frame();
+  assert.equal(f.turns.pushed.length, 1, 'unmuting resumes normal capture');
+
+  await d.stop();
+});
+
+test('muting mid-utterance cancels it instead of waiting it out', async () => {
+  const f = makeFakes(config);
+  const d = new Director(f.deps);
+  await d.start();
+
+  f.turns.speechStart();
+  assert.equal(d.state, 'HEARING');
+  f.audioIn.frame();
+  assert.equal(f.transcriber.current!.pushed.length, 1);
+
+  d.setMuted(true);
+  assert.equal(d.state, 'LISTENING', 'muting instantly cancels the in-progress utterance');
+  f.audioIn.frame();
+  assert.equal(
+    f.transcriber.current!.pushed.length,
+    1,
+    'no further frames are captured once muted',
+  );
+
+  await d.stop();
+});
+
+test('a turn whose stream never produces another event is abandoned, not left silent forever', async () => {
+  const f = makeFakes(config);
+  const d = new Director(f.deps);
+  await d.start();
+
+  f.turns.speechStart();
+  f.transcriber.final('cerca qualcosa di impossibile');
+  f.turns.turnEnd();
+  await f.tick();
+  assert.equal(d.state, 'THINKING');
+
+  // FakeAgentSession.send() blocks forever here: no text, no tool, no done —
+  // exactly the genuinely hung network call the watchdog exists for.
+  f.advance(config.director.turnTimeoutMs + 10);
+  await f.tick();
+
+  assert.equal(d.state, 'LISTENING', 'the turn is abandoned rather than left hanging');
+  assert.ok(
+    f.voice.spoken.some((s) => /qualcosa è andato storto/i.test(s)),
+    'the user is told, not left in silence',
+  );
+  assert.equal(f.agent.interrupts, 1, 'the agent still working on it is told to stop');
+
+  await d.stop();
+});
