@@ -91,6 +91,7 @@ export class CartesiaVoice implements Voice {
     if (signal.aborted) return;
 
     const { model, voiceId, language } = this.#config.voice;
+    const { deviceRate } = this.#config.audio;
     const key = this.#config.cartesiaKey();
 
     /** Nothing off the wire is trusted verbatim: the URL carries the key. */
@@ -157,7 +158,11 @@ export class CartesiaVoice implements Voice {
           transcript,
           voice: { mode: 'id', id: voiceId },
           language,
-          output_format: { container: 'raw', encoding: 'pcm_s16le', sample_rate: 24000 },
+          // Matches config.audio.deviceRate, not an independent number: the
+          // point (spec §3) is zero resampling between Cartesia's output and
+          // what the speaker expects, which only holds if this is the same
+          // value, not a second one a human has to keep in sync by hand.
+          output_format: { container: 'raw', encoding: 'pcm_s16le', sample_rate: deviceRate },
           continue: more,
         }),
       );

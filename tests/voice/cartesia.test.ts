@@ -155,9 +155,10 @@ test('the key is redacted even when the server echoes the connection URL back', 
   );
 });
 
-test('asks for raw 24 kHz PCM16, the rate the audio device runs at', async () => {
-  // Spec §3: the unit runs at 24 kHz on both scopes so TTS audio reaches the
-  // speaker with zero resampling.
+test('asks for raw PCM16 at config.audio.deviceRate, the rate the audio device runs at', async () => {
+  // Spec §3: the unit runs at the same rate on both scopes so TTS audio
+  // reaches the speaker with zero resampling. sample_rate must therefore
+  // track config.audio.deviceRate, not a hardcoded literal.
   const socket = new FakeSocket();
   const voice = new CartesiaVoice(config, { connect: () => socket as never });
 
@@ -174,11 +175,38 @@ test('asks for raw 24 kHz PCM16, the rate the audio device runs at', async () =>
   assert.deepEqual(first.output_format, {
     container: 'raw',
     encoding: 'pcm_s16le',
-    sample_rate: 24000,
+    sample_rate: config.audio.deviceRate,
   });
   assert.equal(first.model_id, config.voice.model);
   assert.equal(first.language, config.voice.language);
   assert.deepEqual(first.voice, { mode: 'id', id: config.voice.voiceId });
+
+  socket.message({ type: 'done' });
+  await pump;
+});
+
+test('sample_rate follows config.audio.deviceRate, not a hardcoded literal', async () => {
+  // Proves the value is wired from config rather than baked in: a config with
+  // a different deviceRate must produce a different outgoing sample_rate.
+  const custom = loadConfig({ CARTESIA_API_KEY: 'sk_test' }) as unknown as {
+    audio: { deviceRate: number };
+  };
+  Object.assign(custom.audio, { deviceRate: 8000 });
+
+  const socket = new FakeSocket();
+  const voice = new CartesiaVoice(custom as never, { connect: () => socket as never });
+
+  const pump = (async () => {
+    for await (const _ of voice.synthesize(sentences('Uno.'), new AbortController().signal)) {
+      // drain
+    }
+  })();
+  await tick(10);
+  socket.open();
+  await tick(10);
+
+  const first = JSON.parse(socket.sent[0]!);
+  assert.equal(first.output_format.sample_rate, 8000);
 
   socket.message({ type: 'done' });
   await pump;
