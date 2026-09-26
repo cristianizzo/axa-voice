@@ -28,26 +28,6 @@ interface FakeSdk {
   returns: number;
   /** Emitted automatically when interrupt() is called, unless disabled. */
   resultOnInterrupt: boolean;
-  /** Answers start()'s warm-up message immediately, unless disabled. */
-  autoAnswerWarmUp: boolean;
-  /**
-   * interrupt() never resolves, the way the SDK gives no guarantee it will
-   * while a background subagent Task is still running (spec: 2026-09-26).
-   */
-  hangInterrupt: boolean;
-  /**
-   * interrupt() rejects instead of hanging or resolving, the way a real
-   * control-protocol request can fail outright (e.g. "control request failed:
-   * session not initialized") rather than merely being slow.
-   */
-  rejectInterrupt: boolean;
-  /**
-   * Resolves every interrupt() call still hung, as if the SDK had eventually
-   * (if belatedly) come back. Real interrupt() calls do not hang forever
-   * either, and leaving the fake's promise permanently unresolved trips
-   * node:test's own dangling-promise detection at process exit.
-   */
-  releaseInterrupts(): void;
 }
 
 function makeFakeSdk(): FakeSdk {
@@ -62,9 +42,6 @@ function makeFakeSdk(): FakeSdk {
     interrupts: 0,
     returns: 0,
     resultOnInterrupt: true,
-    autoAnswerWarmUp: true,
-    hangInterrupt: false,
-    rejectInterrupt: false,
   };
 
   const wake = (): void => {
@@ -75,7 +52,6 @@ function makeFakeSdk(): FakeSdk {
     queued.push(message);
     wake();
   };
-  const hungInterrupts: Array<() => void> = [];
 
   const query = {
     async next(): Promise<IteratorResult<unknown>> {
@@ -106,26 +82,6 @@ function makeFakeSdk(): FakeSdk {
     },
     async interrupt(): Promise<undefined> {
       state.interrupts += 1;
-      // A real control-protocol request can fail outright rather than merely
-      // being slow (e.g. "control request failed: session not initialized"),
-      // especially in exactly the scenario the warm-up give-up path handles:
-      // the session already misbehaving.
-      if (state.rejectInterrupt) throw new Error('control request failed: session not initialized');
-      // The SDK gives no guarantee interrupt() returns promptly (spec:
-      // 2026-09-26): never resolving within a caller's bound is the real,
-      // observed failure mode this simulates. Held open well past any
-      // bound a test exercises, rather than truly eternal — a promise with
-      // nothing at all scheduled to ever settle it trips node:test's own
-      // dangling-async-resource detection, even mid-test.
-      if (state.hangInterrupt) {
-        return new Promise<undefined>((resolve) => {
-          const timer = setTimeout(() => resolve(undefined), 1000);
-          hungInterrupts.push(() => {
-            clearTimeout(timer);
-            resolve(undefined);
-          });
-        });
-      }
       // The real CLI ends the interrupted turn with a result message.
       if (state.resultOnInterrupt) emit({ type: 'result', subtype: 'error_during_execution' });
       return undefined;
@@ -137,17 +93,7 @@ function makeFakeSdk(): FakeSdk {
     return {
       query(prompt: AsyncIterable<{ message: { content: string } }>) {
         void (async () => {
-          let first = true;
-          for await (const turn of prompt) {
-            state.prompts.push(turn.message.content);
-            // start()'s warm-up is always the first message pushed to a fresh
-            // session; answer it immediately so tests do not have to know it
-            // happened at all unless they are specifically testing for it.
-            if (first) {
-              first = false;
-              if (state.autoAnswerWarmUp) emit({ type: 'result', subtype: 'success' });
-            }
-          }
+          for await (const turn of prompt) state.prompts.push(turn.message.content);
         })();
         return query;
       },
@@ -183,27 +129,6 @@ function makeFakeSdk(): FakeSdk {
     set resultOnInterrupt(value: boolean) {
       state.resultOnInterrupt = value;
     },
-    get autoAnswerWarmUp() {
-      return state.autoAnswerWarmUp;
-    },
-    set autoAnswerWarmUp(value: boolean) {
-      state.autoAnswerWarmUp = value;
-    },
-    get hangInterrupt() {
-      return state.hangInterrupt;
-    },
-    set hangInterrupt(value: boolean) {
-      state.hangInterrupt = value;
-    },
-    get rejectInterrupt() {
-      return state.rejectInterrupt;
-    },
-    set rejectInterrupt(value: boolean) {
-      state.rejectInterrupt = value;
-    },
-    releaseInterrupts() {
-      while (hungInterrupts.length > 0) hungInterrupts.pop()?.();
-    },
   };
 }
 
@@ -225,30 +150,17 @@ async function settle(times = 6): Promise<void> {
 
 async function startSession(
   sdk: FakeSdk,
-  overrides: Partial<{ approvalTimeoutMs: number; interruptDrainMs: number; turnTimeoutMs: number }> = {},
+  overrides: Partial<{ approvalTimeoutMs: number; interruptDrainMs: number }> = {},
 ): Promise<ClaudeAgentSession> {
-  const cfg =
-    overrides.approvalTimeoutMs ?? overrides.turnTimeoutMs
-      ? ({
-          ...config,
-          director: {
-            ...config.director,
-            approvalTimeoutMs: overrides.approvalTimeoutMs ?? config.director.approvalTimeoutMs,
-            turnTimeoutMs: overrides.turnTimeoutMs ?? config.director.turnTimeoutMs,
-          },
-        } as never)
-      : config;
+  const cfg = overrides.approvalTimeoutMs
+    ? ({ ...config, director: { ...config.director, approvalTimeoutMs: overrides.approvalTimeoutMs } } as never)
+    : config;
   const session = new ClaudeAgentSession(cfg, {
     startupFn: sdk.startupFn,
     interruptDrainMs: overrides.interruptDrainMs,
   });
   await session.start();
   await settle();
-  // start()'s own warm-up message is real traffic (spec: session.ts #warmUp),
-  // but tests that predate it assert prompts() against exactly the turns
-  // they themselves sent. Drop it here, once, rather than teach every test
-  // about a message none of them are about.
-  sdk.prompts.length = 0;
   return session;
 }
 
@@ -294,18 +206,30 @@ test('only read-only tools are pre-approved', () => {
 // --- Event mapping ---------------------------------------------------------
 
 test('text deltas become AgentEvents', async () => {
-  const sdk = makeFakeSdk();
-  const session = await startSession(sdk);
-  const events = drain(session.send('ciao'));
+  const session = new ClaudeAgentSession(config, {
+    startupFn: (async () => ({
+      query: () =>
+        (async function* () {
+          yield {
+            type: 'stream_event',
+            event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Ciao' } },
+          };
+          yield {
+            type: 'stream_event',
+            event: { type: 'content_block_delta', delta: { type: 'text_delta', text: ' mondo' } },
+          };
+          yield { type: 'result', subtype: 'success' };
+        })(),
+      close: () => {},
+    })) as never,
+  });
+  await session.start();
 
-  await settle();
-  sdk.emit(textDelta('Ciao'));
-  sdk.emit(textDelta(' mondo'));
-  sdk.emit(RESULT);
-
-  const deltas = (await events).filter((e) => e.type === 'text').map((e) => e.delta);
+  const deltas: string[] = [];
+  for await (const event of session.send('ciao')) {
+    if (event.type === 'text') deltas.push(event.delta);
+  }
   assert.deepEqual(deltas, ['Ciao', ' mondo']);
-  await session.close();
 });
 
 test('the end of a text block is signalled, or the last sentence waits for the next tool', async () => {
@@ -444,245 +368,6 @@ test('send() before start() is an error, not a silent no-op', () => {
     /start\(\)/,
     'a dropped turn is invisible in voice',
   );
-});
-
-// --- Warm-up -----------------------------------------------------------------
-
-test('start() sends exactly one throwaway message before resolving', async () => {
-  // The message triggers the first real model round trip during boot (spec:
-  // session.ts #warmUp) instead of on the caller's first send().
-  const sdk = makeFakeSdk();
-  const session = new ClaudeAgentSession(config, { startupFn: sdk.startupFn });
-  await session.start();
-  await settle();
-
-  assert.deepEqual(sdk.prompts, ['.'], 'start() must push exactly one throwaway message');
-  await session.close();
-});
-
-test('the warm-up message never reaches a real send() as an event', async () => {
-  const sdk = makeFakeSdk();
-  const session = new ClaudeAgentSession(config, { startupFn: sdk.startupFn });
-  await session.start();
-  await settle();
-
-  const events = drain(session.send('ciao'));
-  await settle();
-  sdk.emit(textDelta('Ciao.'));
-  sdk.emit(RESULT);
-
-  assert.deepEqual(await events, [
-    { type: 'text', delta: 'Ciao.' },
-    { type: 'done' },
-  ]);
-  assert.deepEqual(sdk.prompts, ['.', 'ciao'], 'the warm-up turn precedes the real one, once');
-  await session.close();
-});
-
-test('a normal send() after start() has no leftover state from the warm-up turn', async () => {
-  const sdk = makeFakeSdk();
-  const session = await startSession(sdk); // drops the warm-up entry from prompts
-
-  const events = drain(session.send('cerca il meteo'));
-  await settle();
-  sdk.emit({
-    type: 'stream_event',
-    parent_tool_use_id: null,
-    event: {
-      type: 'content_block_start',
-      index: 0,
-      content_block: { type: 'tool_use', id: 'tu_1', name: 'WebSearch', input: {} },
-    },
-  });
-  sdk.emit({
-    type: 'user',
-    parent_tool_use_id: null,
-    message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu_1', content: 'ok' }] },
-  });
-  sdk.emit(RESULT);
-
-  const tools = (await events).filter((e) => e.type === 'tool');
-  assert.deepEqual(tools, [
-    { type: 'tool', name: 'WebSearch', phase: 'start' },
-    { type: 'tool', name: 'WebSearch', phase: 'end' },
-  ]);
-  assert.deepEqual(sdk.prompts, ['cerca il meteo'], 'turn tracking must start clean after the warm-up ends');
-  await session.close();
-});
-
-test('a warm-up that never completes still lets start() resolve within its bound', async () => {
-  const sdk = makeFakeSdk();
-  sdk.autoAnswerWarmUp = false; // the model never answers the throwaway message
-
-  const started = Date.now();
-  const session = await startSession(sdk, { turnTimeoutMs: 50 });
-  assert.ok(Date.now() - started < 500, 'a hung warm-up must not block app boot');
-  assert.equal(sdk.interrupts, 1, 'the give-up path must stop the CLI still working on the abandoned turn');
-
-  // The fake CLI acks the interrupt with a result automatically (the default
-  // resultOnInterrupt behaviour), the same contract interrupt()'s drain
-  // relies on. The session must still be usable afterwards.
-  const events = drain(session.send('ciao'));
-  await settle();
-  sdk.emit(textDelta('Ciao.'));
-  sdk.emit(RESULT);
-  assert.deepEqual(await events, [
-    { type: 'text', delta: 'Ciao.' },
-    { type: 'done' },
-  ]);
-  await session.close();
-});
-
-test('a warm-up whose interrupt() itself never returns still lets start() resolve within its bound', async () => {
-  // interrupt() has no guarantee of returning promptly while a background
-  // subagent Task is still running (spec: 2026-09-26 — the same incident
-  // the Director's own bounded-interrupt wrapper documents in director.ts
-  // #interrupt). #warmUp sits directly on start(), and src/cli.ts awaits
-  // that with no race of its own, so a hang here used to mean the process
-  // never boots at all. It must be bounded by
-  // config.director.interruptTimeoutMs, exactly like the Director bounds
-  // its own call to the same method.
-  const sdk = makeFakeSdk();
-  sdk.autoAnswerWarmUp = false; // the model never answers the throwaway '.' message
-  sdk.hangInterrupt = true; // interrupt() itself never resolves
-
-  const fast = {
-    ...config,
-    director: { ...config.director, turnTimeoutMs: 50, interruptTimeoutMs: 80 },
-  } as never;
-  const session = new ClaudeAgentSession(fast, { startupFn: sdk.startupFn, interruptDrainMs: 50 });
-
-  const started = Date.now();
-  await session.start();
-  assert.ok(Date.now() - started < 1000, 'a hung interrupt() must not block app boot forever');
-  assert.equal(sdk.interrupts, 1, 'interrupt() must still have been attempted');
-  sdk.releaseInterrupts(); // it does eventually come back, just not within budget
-
-  // Neither interrupt() nor the drain came back in time, so the give-up path
-  // armed the quarantine expecting the abandoned turn's belated result. The
-  // CLI eventually reports it, same as it would after a real interrupt(); it
-  // must be swallowed rather than mistaken for the real turn's own result,
-  // exactly as #dispatch's stale-result handling already promises elsewhere.
-  sdk.emit({ type: 'result', subtype: 'error_during_execution' });
-  await settle();
-
-  // The session must still be usable afterwards.
-  const events = drain(session.send('ciao'));
-  await settle();
-  sdk.emit(textDelta('Ciao.'));
-  sdk.emit(RESULT);
-  assert.deepEqual(await events, [
-    { type: 'text', delta: 'Ciao.' },
-    { type: 'done' },
-  ]);
-  await session.close();
-});
-
-test('a warm-up whose interrupt() rejects still lets start() resolve, and the session stays usable', async () => {
-  // withDeadline() only bounds a PENDING promise: it does nothing to protect
-  // against the promise REJECTING outright. interrupt() is a control-protocol
-  // request that can reject (e.g. "control request failed: session not
-  // initialized"), especially in exactly the scenario the give-up path
-  // handles — the session already misbehaving. Left unguarded, that rejection
-  // used to propagate straight up through #warmUp() -> start(), which
-  // src/cli.ts awaits with no race of its own: a rejection here aborted the
-  // entire app boot over what is supposed to be a best-effort warm-up.
-  const sdk = makeFakeSdk();
-  sdk.autoAnswerWarmUp = false; // the model never answers the throwaway '.' message
-  sdk.rejectInterrupt = true; // interrupt() rejects instead of hanging or resolving
-
-  const session = await startSession(sdk, { turnTimeoutMs: 50 });
-  assert.equal(sdk.interrupts, 1, 'the give-up path must still attempt interrupt() despite the rejection');
-
-  // interrupt() rejected before it could ever emit the abandoned turn's own
-  // result, so — same as when interrupt() merely hangs past its bound — the
-  // drain also times out and the give-up path arms the stale-result
-  // quarantine expecting a belated result for the abandoned turn. Feed it
-  // one, exactly as the "interrupt() never returns" case does, so the
-  // quarantine clears instead of swallowing the next turn's own result.
-  sdk.emit({ type: 'result', subtype: 'error_during_execution' });
-  await settle();
-
-  // The session must still be usable afterwards, exactly as after a hung or
-  // successful interrupt().
-  const events = drain(session.send('ciao'));
-  await settle();
-  sdk.emit(textDelta('Ciao.'));
-  sdk.emit(RESULT);
-  assert.deepEqual(await events, [
-    { type: 'text', delta: 'Ciao.' },
-    { type: 'done' },
-  ]);
-  await session.close();
-});
-
-test('a warm-up give-up interrupts the CLI, so its belated stream events never reach the first real turn', async () => {
-  // This is the exact bug the review caught: the give-up path armed the
-  // stale-result quarantine and ended the turn locally, but never told the
-  // CLI to stop working on the abandoned '.' turn. The quarantine only guards
-  // the one `result` message a turn owes on its own — #emit() now also
-  // checks it before appending anything to #turn, which is what actually
-  // closes the gap for stream events too (spec: session.ts #emit). Without
-  // the interrupt() call (and the drain that follows it, exactly as in
-  // interrupt()), a content_block_start/text_delta belonging to the dead
-  // warm-up turn would land directly in the user's first real turn and get
-  // spoken. Crucially, the leaked events are emitted here only AFTER
-  // send()'s real turn has already reassigned #turn — emitting them before
-  // that would prove nothing, since #emit()'s plain "no current turn" check
-  // would drop them regardless of whether the interrupt/quarantine path ran
-  // at all.
-  const sdk = makeFakeSdk();
-  sdk.autoAnswerWarmUp = false; // the model never answers the throwaway '.' message
-  sdk.resultOnInterrupt = false; // the interrupt is not acked immediately
-
-  const fast = {
-    ...config,
-    director: { ...config.director, turnTimeoutMs: 50 },
-  } as never;
-  const session = new ClaudeAgentSession(fast, { startupFn: sdk.startupFn, interruptDrainMs: 80 });
-
-  const starting = session.start();
-  await settle();
-  await new Promise((resolve) => setTimeout(resolve, 60)); // past turnTimeoutMs: the warm-up gives up
-  await settle();
-  assert.equal(sdk.interrupts, 1, 'give-up must interrupt the CLI, exactly like a real interrupt() does');
-
-  // Neither the interrupt nor a result arrives in time: the drain itself
-  // times out, so the quarantine arms and start() resolves with the CLI
-  // still owing output for the abandoned turn.
-  await new Promise((resolve) => setTimeout(resolve, 120)); // past interruptDrainMs
-  await settle();
-  await starting; // start() only resolves once the doomed turn is given up on
-  sdk.prompts.length = 0;
-
-  // The real turn starts, reassigning #turn away from the abandoned one...
-  const events = drain(session.send('ciao davvero'));
-  await settle();
-
-  // ...and only now, with #turn already the new real turn, does the CLI
-  // belatedly stream its reply to the abandoned '.' turn and report it
-  // ended. This is the actual race: nothing but the quarantine stops these
-  // from being attributed to the turn that is now current.
-  sdk.emit({
-    type: 'stream_event',
-    parent_tool_use_id: null,
-    event: { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
-  });
-  sdk.emit(textDelta('Ciao! Come posso aiutarti?')); // the leaked warm-up reply
-  sdk.emit({ type: 'result', subtype: 'error_during_execution' }); // the belated warm-up result
-  await settle();
-
-  sdk.emit(textDelta('Risposta vera.'));
-  sdk.emit(RESULT);
-
-  const deltas = (await events).filter((e) => e.type === 'text').map((e) => e.delta);
-  assert.deepEqual(
-    deltas,
-    ['Risposta vera.'],
-    'the abandoned warm-up turn must never leak stream events into the first real turn, ' +
-      'even after #turn has been reassigned',
-  );
-  await session.close();
 });
 
 // --- One long-lived session ------------------------------------------------

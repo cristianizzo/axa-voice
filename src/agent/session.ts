@@ -1,4 +1,3 @@
-import { homedir } from 'node:os';
 import { startup, type Options, type Query, type SDKMessage, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
 import type { AgentEvent, AgentSession, PermissionRequest } from '../types.ts';
 import type { Config } from '../config.ts';
@@ -7,12 +6,6 @@ const SPOKEN_STYLE = `
 Stai parlando a voce, non scrivendo. Frasi brevi, tono naturale, niente elenchi puntati.
 Non leggere mai codice ad alta voce: scrivilo e dì "te l'ho scritta".
 Accorcia i percorsi dei file. Gli strumenti che hai sono veri: usali davvero.
-Se la domanda richiede una ricerca (notizie, orari, risultati sportivi, prezzi,
-voli, qualunque cosa cambi nel tempo), cerca sul serio: usa gli strumenti,
-prova query diverse se la prima non basta, e non fermarti al primo tentativo
-vuoto. "Non lo so" o "non ho trovato nulla" va detto solo dopo aver
-effettivamente cercato, mai come scorciatoia. Se la ricerca fallisce per un
-problema tecnico, dillo chiaramente invece di restare in silenzio.
 `.trim();
 
 /**
@@ -24,19 +17,13 @@ const INTERRUPT_DRAIN_MS = 2000;
 const CLOSE_TIMEOUT_MS = 2000;
 
 /**
- * How long the CLI's tail output for an abandoned turn is still expected,
- * once we've given up waiting on it (interrupt() or its drain timed out).
+ * How long a result owed by an interrupted turn is still expected.
  *
- * The CLI processes turns over a single ordered stream, one at a time: it
- * cannot start streaming a NEW turn's own output before it reports the old
- * one done, so anything that arrives while this window is armed — the
- * result and any stream events alike — still belongs to the turn we gave up
- * on, never to whatever #turn has been reassigned to since. #emit() drops
- * everything while it is armed; #dispatch's result branch swallows the one
- * `result` message directly (see #takeStaleResult). Bounded the other way
- * too: a result that never arrives at all would otherwise leave the
- * quarantine armed for ever, both eating a legitimate future result and
- * silently dropping a legitimate future turn's speech.
+ * The CLI sends exactly one result per turn it accepted, and they arrive in
+ * order, so the first result after a give-up is the dead turn's. It has to be
+ * swallowed or it ends the next turn the moment that turn starts. Bounded the
+ * other way too: a result that never arrives at all would otherwise leave the
+ * quarantine armed for ever, and it would eat a legitimate one instead.
  */
 const STALE_RESULT_WINDOW_MS = 10_000;
 
@@ -44,17 +31,6 @@ export function buildOptions(config: Config): Options {
   return {
     model: 'sonnet',
     includePartialMessages: true,
-    // Without this the bundled CLI computes its OAuth Keychain service name
-    // from an unset config dir ("Claude Code-credentials", no suffix) instead
-    // of the one the interactive `claude` CLI actually uses ("...-<hash of
-    // ~/.claude>"). Two entries for one account meant this long-running
-    // process refreshed a copy nobody else maintained, and a single failed
-    // refresh (invalid_grant) triggers the CLI's local-logout path, which
-    // deletes that entry outright — silently breaking every future turn until
-    // someone notices and copies the other entry's token back over by hand.
-    // Matching the interactive CLI's env merges both onto the one entry it
-    // already keeps valid.
-    env: { ...process.env, CLAUDE_CONFIG_DIR: `${homedir()}/.claude` },
     // All three are required. strictMcpConfig ignores project/user/plugin MCP
     // config; mcpServers leaves nothing to connect; settingSources must be
     // explicit because its default loads everything (spec §12). Measured: with
@@ -62,11 +38,6 @@ export function buildOptions(config: Config): Options {
     strictMcpConfig: true,
     mcpServers: {},
     settingSources: ['user'],
-    // `tools` is what makes a tool available at all; `allowedTools` only
-    // controls which of the available ones skip the confirmation prompt. Without
-    // this, WebSearch/WebFetch were never offered to the model regardless of
-    // allowedTools listing them.
-    tools: { type: 'preset', preset: 'claude_code' },
     // Read-only tools never prompt: their worst case is wasted time and the
     // user is present and listening (spec §8). The SDK warns that bare names
     // here auto-approve BEFORE canUseTool runs, so the callback is shadowed for
@@ -197,10 +168,7 @@ export class ClaudeAgentSession implements AgentSession {
   #blocks = new Map<number, { kind: 'text' | 'tool'; id?: string }>();
   /** tool_use id -> tool name, so a tool_result can close the bracket. */
   #toolNames = new Map<string, string>();
-  /**
-   * Armed while an abandoned turn's tail (its result AND any stream events)
-   * is still expected. See STALE_RESULT_WINDOW_MS.
-   */
+  /** Armed while an interrupted turn still owes a result. See the constant. */
   #staleResult: NodeJS.Timeout | undefined;
 
   constructor(
@@ -213,21 +181,7 @@ export class ClaudeAgentSession implements AgentSession {
     this.#closeTimeoutMs = opts.closeTimeoutMs ?? CLOSE_TIMEOUT_MS;
   }
 
-  /**
-   * Pre-warms the subprocess (~900 ms) AND the first real model round trip, so
-   * turn 1 does not pay for either.
-   *
-   * The subprocess spawn + control-protocol handshake used to be the only
-   * thing paid for here. The actual first API call — cold TLS, the first
-   * prompt-cache write for the (large) system prompt, credential/token use —
-   * was still deferred to the user's first spoken utterance. That first real
-   * round trip can occasionally run far longer than later turns, and when it
-   * did, the Director's 45 s turn watchdog could fire before it finished:
-   * the user's real first question got aborted in silence, with zero events
-   * ever emitted. Sending a throwaway message through the same turn
-   * machinery here moves that cost into boot, where "scaldo la sessione…"
-   * already sets the expectation of a wait.
-   */
+  /** Pre-warms the subprocess (~900 ms) so turn 1 does not pay for it. */
   async start(): Promise<void> {
     const options: Options = {
       ...buildOptions(this.#config),
@@ -249,89 +203,6 @@ export class ClaudeAgentSession implements AgentSession {
     const query = warm.query(this.#input.stream);
     this.#query = query;
     this.#pumpDone = this.#pump(query);
-    await this.#warmUp();
-  }
-
-  /**
-   * Pushes one throwaway message ('.') through the real turn machinery
-   * (createTurn / #input.push / turn.settled — the exact path send() uses)
-   * and waits for it to settle, so the first genuine API round trip happens
-   * during start() instead of on the caller's first send(). Its events are
-   * never read by anyone: the array they land in goes out of scope with the
-   * turn.
-   *
-   * Bounded by config.director.turnTimeoutMs rather than a new constant of
-   * its own: it is the same question the Director's watchdog already
-   * answers — "how long is a legitimately slow round trip allowed to run
-   * before something has gone genuinely wrong" — so duplicating that budget
-   * under a different name would only invite the two to drift apart. Best
-   * effort only: a warm-up that times out must not throw and abort startup,
-   * it must just stop waiting.
-   *
-   * The give-up path below mirrors interrupt() exactly, and for the same
-   * reason: on timeout the CLI is still actively working on the abandoned
-   * '.' turn, and merely arming the stale-result quarantine does not stop
-   * it. Quarantine only guards the one `result` message a turn owes — it
-   * does nothing on its own for stream events, which #emit() would
-   * otherwise append to whatever #turn currently is. Left unchecked, any
-   * content_block_start/text_delta/tool events the CLI produces in belated
-   * reply to '.' would land directly in the caller's first real turn and get
-   * spoken; #emit() now also drops events while the quarantine is armed (see
-   * #staleResult), which is what actually closes that gap. Calling
-   * `this.#query.interrupt()` first actually stops the CLI from continuing
-   * that turn, and draining for `this.#interruptDrainMs` gives its already
-   * in-flight output (including the final result) time to land while #turn
-   * is still the doomed turn, instead of the next one — so only the rare
-   * straggler that outlives the drain window still needs the quarantine.
-   *
-   * The `interrupt()` call itself is bounded by
-   * `config.director.interruptTimeoutMs`, the same budget and the same
-   * hazard the Director's own bounded-interrupt wrapper guards against (see
-   * director.ts #interrupt): the SDK gives no guarantee interrupt() returns
-   * promptly while a background subagent Task is still running (spec:
-   * 2026-09-26, a barge-in that froze the whole app because interrupt()
-   * never came back). Everywhere else that hazard sits behind the
-   * Director's own bound; here it would sit directly on `start()`, which
-   * `src/cli.ts` awaits with no race of its own — a hang here would freeze
-   * boot forever, not just one turn. A timed-out interrupt() falls straight
-   * into the same give-up path as a timed-out drain, on purpose: whichever
-   * one didn't return in time, the CLI may still be mid-flight, and the
-   * response is identical either way.
-   */
-  async #warmUp(): Promise<void> {
-    const turn = createTurn();
-    this.#turn = turn;
-    this.#input.push('.');
-    await withDeadline(turn.settled, this.#config.director.turnTimeoutMs);
-    if (this.#turn !== turn) return; // settled already; #endTurn cleared it
-
-    // Mark the turn before the interrupt fires: the result the CLI emits for
-    // it is an error (error_during_execution), and must read as the expected
-    // end of a turn we gave up on, not as a genuine failure.
-    turn.interrupted = true;
-    // NOT abort: aborting tears the session down and takes ~2 s (spec §6).
-    await withDeadline(
-      Promise.resolve(this.#query?.interrupt()).catch(() => undefined),
-      this.#config.director.interruptTimeoutMs,
-    );
-    if (turn.ended) return;
-
-    // The abandoned turn still owes a result — whether interrupt() returned
-    // in time or not. Swallow it here, or it lands in the middle of the next
-    // turn and ends it early.
-    await withDeadline(turn.settled, this.#interruptDrainMs);
-    if (this.#turn !== turn) return;
-
-    // Still ours means neither interrupt() nor the result it should have
-    // provoked came back within budget. Ending the turn locally frees
-    // start() to resolve, but the CLI may still be mid-flight: arm the
-    // quarantine so both the belated result and any belated stream events
-    // are swallowed instead of leaking into the next turn.
-    this.#staleResult = setTimeout(() => {
-      this.#staleResult = undefined;
-    }, STALE_RESULT_WINDOW_MS);
-    this.#staleResult.unref();
-    this.#endTurn();
   }
 
   /**
@@ -389,8 +260,7 @@ export class ClaudeAgentSession implements AgentSession {
         this.#endTurn();
         return;
       }
-      const detail = message.subtype === 'success' ? message.result : message.subtype;
-      this.#failTurn(new Error(`Claude ended the turn with an error: ${detail}`));
+      this.#failTurn(new Error(`Claude ended the turn with an error (${message.subtype})`));
     }
   }
 
@@ -441,12 +311,6 @@ export class ClaudeAgentSession implements AgentSession {
   #emit(event: AgentEvent): void {
     const turn = this.#turn;
     if (!turn) return;
-    // While the quarantine from a give-up (#warmUp or interrupt()) is armed,
-    // the CLI is still flushing the turn we abandoned, not whatever #turn
-    // has been reassigned to since — the single ordered stream cannot have
-    // moved on yet (see STALE_RESULT_WINDOW_MS). Anything that arrives here
-    // still belongs to the ghost, not to the caller's real turn.
-    if (this.#staleResult) return;
     turn.events.push(event);
     turn.wake?.();
     turn.wake = undefined;

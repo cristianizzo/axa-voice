@@ -90,16 +90,7 @@ try {
   console.log('avvio whisper…');
   await whisper.start();
   console.log('scaldo la sessione…');
-  // Pays for the subprocess spawn AND a full warm-up model round trip, so
-  // neither lands on the user's first real turn (spec §4). Normally a second
-  // or so, but on the warm-up's give-up path this can take up to
-  // config.director.turnTimeoutMs + config.director.interruptTimeoutMs +
-  // the interrupt drain (45 s + 3 s + 2 s = 50 s in production) before
-  // resolving. Every step of that path — the wait, the interrupt() call
-  // itself, and the drain — is now individually bounded (session.ts
-  // #warmUp), so this is a genuine worst case, not a hang: an interrupt()
-  // that never returns used to be able to block this forever instead.
-  await agent.start();
+  await agent.start(); // ~900ms, must not land on the first turn (spec §4)
   console.log('apro il microfono…');
   await director.start();
   console.log('pronto. parla pure.  (ctrl-c per uscire, barra spaziatrice per silenziare)');
