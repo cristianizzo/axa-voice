@@ -29,7 +29,7 @@ const NO = new Set([
 const MAX_WORDS = 4;
 
 /** Lowercase, strip accents and every non-alphanumeric character, collapse spaces. */
-function normalise(text: string): string {
+export function normalise(text: string): string {
   return text
     .toLowerCase()
     .normalize('NFD')

@@ -1,5 +1,6 @@
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { homedir } from 'node:os';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -15,6 +16,8 @@ export interface Config {
   readonly voice: { model: string; voiceId: string; apiVersion: string; language: string };
   readonly director: { approvalTimeoutMs: number };
   readonly readOnlyTools: readonly string[];
+  /** The screen-control toggle script, run directly by the Director (spec: gui-command.ts). */
+  readonly gui: { scriptPath: string };
   /** Non-enumerable on purpose: keeps the secret out of logs and crash dumps. */
   cartesiaKey(): string;
 }
@@ -52,6 +55,7 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
     },
     director: { approvalTimeoutMs: 10000 },
     readOnlyTools: ['Read', 'Glob', 'Grep', 'WebSearch', 'WebFetch', 'ToolSearch'] as const,
+    gui: { scriptPath: join(homedir(), '.claude', 'bin', 'gui') },
   };
 
   Object.defineProperty(config, 'cartesiaKey', {

@@ -383,6 +383,7 @@ export function makeFakes(config: Config, overrides: FakeOverrides = {}) {
     // The filter is pure, so there is no reason to fake it — and faking it would
     // hide the seam where a block-final sentence is released.
     filter: new SentenceSpeechFilter(),
+    runGui: async (mode) => (mode === 'on' ? 'Gui attivata.' : 'Gui disattivata.'),
     timers,
     onError: (message) => errors.push(message),
     ...overrides,

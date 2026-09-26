@@ -137,6 +137,7 @@ test(
       agent,
       voice,
       filter: new SentenceSpeechFilter(),
+      runGui: async (mode) => (mode === 'on' ? 'Gui attivata.' : 'Gui disattivata.'),
       onError: (message) => console.error(`[audio] ${message}`),
     });
 

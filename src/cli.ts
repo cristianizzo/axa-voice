@@ -8,6 +8,7 @@ import { ClaudeAgentSession } from './agent/session.ts';
 import { CartesiaVoice } from './voice/cartesia.ts';
 import { SentenceSpeechFilter } from './filter/speech-filter.ts';
 import { Director } from './director/director.ts';
+import { runGuiCommand } from './system/gui.ts';
 
 const envFile = new URL('../.env', import.meta.url);
 try {
@@ -46,6 +47,7 @@ const director = new Director({
   agent,
   voice,
   filter: new SentenceSpeechFilter(),
+  runGui: (mode) => runGuiCommand(config.gui.scriptPath, mode),
   onError: (message) => console.error(`\n[audio] ${message}`),
   // Off by default: the failure this exists to diagnose was a silent process,
   // not a noisy one. Set AXA_DEBUG=1 to get the per-turn trace back.

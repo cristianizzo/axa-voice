@@ -230,6 +230,29 @@ test('a stop word arriving after the turn already ended is an ordinary utterance
   await d.stop();
 });
 
+test('a gui toggle command never reaches Claude', async () => {
+  const f = makeFakes(config, {
+    runGui: async (mode) => `called with ${mode}`,
+  });
+  const d = new Director(f.deps);
+  await d.start();
+
+  f.turns.speechStart();
+  f.transcriber.final('attiva la gui');
+  f.turns.turnEnd();
+  await f.tick();
+
+  assert.deepEqual(f.agent.sent, [], 'the deny-listed Bash(gui on:*) rule must never be reached');
+  assert.equal(d.state, 'LISTENING');
+  assert.deepEqual(
+    f.voice.spoken,
+    ['called with on'],
+    'the confirmation is a line the Director says itself, not an answer from Claude',
+  );
+
+  await d.stop();
+});
+
 test('a hallucinated transcript is never queued', async () => {
   const f = makeFakes(config);
   const d = new Director(f.deps);

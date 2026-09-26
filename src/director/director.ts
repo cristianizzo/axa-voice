@@ -2,6 +2,7 @@ import type { Config } from '../config.ts';
 import { clean } from '../stt/clean.ts';
 import { toSpokenForm } from '../filter/speech-filter.ts';
 import { interpretApproval, isStopCommand } from './approval.ts';
+import { interpretGuiCommand } from './gui-command.ts';
 import { progressLine } from './progress.ts';
 import type {
   AgentSession,
@@ -43,6 +44,8 @@ export interface DirectorDeps {
   agent: AgentSession;
   voice: Voice;
   filter: SpeechFilter;
+  /** Runs the gui on/off toggle directly. See gui-command.ts for why it never goes through Claude. */
+  runGui: (mode: 'on' | 'off') => Promise<string>;
   sinks?: OutputSink[];
   timers?: Timers;
   /** Where technical detail goes. The user hears a short line instead. */
@@ -477,6 +480,14 @@ export class Director {
     if (!text) {
       // A cough that whisper turned into "[Musica]" is not a turn.
       this.#setState('LISTENING');
+      return;
+    }
+    const gui = interpretGuiCommand(text);
+    if (gui) {
+      // Never reaches Claude: see gui-command.ts for why. Handled as a spoken
+      // line the Director says itself, not a turn the agent answers.
+      this.#setState('LISTENING');
+      void this.#deps.runGui(gui).then((line) => this.#say(line));
       return;
     }
     this.#ask(text);
