@@ -82,16 +82,42 @@ blocked.
 So axa-voice owns the turn loop itself, driving one long-lived Claude session. It reads
 your `~/.claude/`, so your existing skills, agents and MCP servers work unchanged —
 though MCP servers are loaded on demand, because connecting them all up front costs
-5–7 seconds on every turn. A thin plugin exposing `/voice` to launch it comes later —
-packaging, not architecture.
+5–7 seconds on every turn. A thin plugin exposing `/axa-voice` to launch it is described
+below — packaging, not architecture.
 
 Full reasoning and doc citations in [§2 of the design](docs/superpowers/specs/2026-09-11-voice-agent-design.md).
+
+## Install as a Claude Code plugin
+
+M2 packages the standalone app above as a plugin whose only job is launching it. The
+plugin does not replace the turn loop or talk to Claude Code's own session — it just
+starts `node src/cli.ts` as a detached background process (no window, since this is
+audio-only: mic in, speaker out) and gets out of the way.
+
+Add this checkout as a plugin (from within Claude Code):
+
+```
+/plugin marketplace add /absolute/path/to/axa-voice
+/plugin install axa-voice
+```
+
+or point Claude Code at the git remote instead of a local path, if installing on another
+machine. Then, from any project, in any working directory:
+
+```
+/axa-voice
+```
+
+This starts axa-voice in the background and replies with a one-line confirmation. Running
+`/axa-voice` again while it's already running reports that instead of starting a second
+instance — two instances would fight over the same microphone and speaker. There is no
+`/axa-voice stop`; kill the reported PID, or `pkill -f src/cli.ts`.
 
 ## Roadmap
 
 - **M1 — the loop.** mic → Claude → voice, with echo cancellation and barge-in. Run it
   with `axa-voice`. This either works or the project does not exist.
-- **M2 — plugin wrapper.** Installable plugin exposing `/voice`.
+- **M2 — plugin wrapper.** Installable plugin exposing `/axa-voice`.
 - **M3 — avatar.** A 3D head on the monitor, lip-synced from the same audio stream.
 - **M4 — holographic display.** Same audio sink, different screen.
 
