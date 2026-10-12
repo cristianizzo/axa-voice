@@ -50,8 +50,11 @@ export async function preflight(config: Config): Promise<void> {
   if (!(await portIsFree(port))) {
     throw new Error(
       `port ${port} is already in use. macOS lets a second whisper-server bind the ` +
-        'same port and then splits requests between them, so transcripts come from an ' +
-        'unpredictable model. Stop the other process before starting.',
+        'same port with no error on either process, and silently routes all new traffic ' +
+        'to whichever one bound most recently — not a round-robin split. If that other ' +
+        'process is a stray benchmark or an old instance, every transcript comes from an ' +
+        'unknown, possibly overloaded process instead of this one. Stop the other process ' +
+        'before starting.',
     );
   }
 }

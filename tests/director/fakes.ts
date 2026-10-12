@@ -37,6 +37,10 @@ class FakeTimers implements Timers {
     this.#pending.delete(handle as number);
   }
 
+  now(): number {
+    return this.#now;
+  }
+
   /** Fire everything due, oldest first — a later timer must not jump the queue. */
   advance(ms: number): void {
     this.#now += ms;
@@ -102,6 +106,12 @@ class FakeAudioOutput implements AudioOutput {
   pendingMs = 0;
   flushes = 0;
   readonly frames: AudioFrame[] = [];
+  /**
+   * Real `isPlaying()` derives from device-side timing this fake does not
+   * model; a test that cares sets this directly instead. Defaults to `false`
+   * so every existing test — none of which is about self-play — is unaffected.
+   */
+  playing = false;
 
   /**
    * Audio this device will never render, because a flush threw it away.
@@ -138,11 +148,22 @@ class FakeAudioOutput implements AudioOutput {
   }
 
   isPlaying(): boolean {
-    return false;
+    return this.playing;
   }
 
+  /**
+   * What `#waitForRoom` (director.ts) throttles on. Defaults to 0 so every
+   * existing test — none of which is about the feed/render gap — sees the
+   * same "never throttles" behaviour it always has. A test that needs a
+   * real gap between what a Voice's `feeding` task has pulled and what has
+   * actually reached this device (the gap Bug A lived in) sets this
+   * directly, the same way `playing` above is a test-set override for
+   * something the fake does not otherwise model.
+   */
+  buffered = 0;
+
   bufferedMs(): number {
-    return 0;
+    return this.buffered;
   }
 }
 
@@ -150,7 +171,9 @@ class FakeStream implements TranscriptionStream {
   closed = false;
   readonly pushed: AudioFrame[] = [];
   readonly #partialHandlers = new Set<(text: string) => void>();
-  readonly #finalHandlers = new Set<(text: string) => void>();
+  readonly #finalHandlers = new Set<
+    (text: string, language: string, confidence: number | undefined) => void
+  >();
 
   push(frame: AudioFrame): void {
     this.pushed.push(frame);
@@ -161,7 +184,9 @@ class FakeStream implements TranscriptionStream {
     return () => this.#partialHandlers.delete(cb);
   }
 
-  onFinal(cb: (text: string) => void): Unsubscribe {
+  onFinal(
+    cb: (text: string, language: string, confidence: number | undefined) => void,
+  ): Unsubscribe {
     this.#finalHandlers.add(cb);
     return () => this.#finalHandlers.delete(cb);
   }
@@ -174,8 +199,17 @@ class FakeStream implements TranscriptionStream {
     for (const handler of this.#partialHandlers) handler(text);
   }
 
-  emitFinal(text: string): void {
-    for (const handler of this.#finalHandlers) handler(text);
+  /**
+   * `language` defaults to 'it' (config's own starting default), not '', so
+   * every pre-existing test call site (`f.transcriber.final('...')`, no
+   * language argument) keeps landing on the language the Director already
+   * started in — i.e. keeps `#maybeSwitchLanguage` a no-op for every test
+   * that does not care about the language-switch feature at all. Only tests
+   * that pass an explicit different `language` (and enough words, see
+   * director.ts's MIN_WORDS_FOR_LANGUAGE_SWITCH) exercise a real switch.
+   */
+  emitFinal(text: string, language = 'it', confidence: number | undefined = undefined): void {
+    for (const handler of this.#finalHandlers) handler(text, language, confidence);
   }
 }
 
@@ -196,18 +230,18 @@ class FakeTranscriber implements Transcriber {
     this.current?.emitPartial(text);
   }
 
-  final(text: string): void {
-    this.current?.emitFinal(text);
+  final(text: string, language = 'it', confidence: number | undefined = undefined): void {
+    this.current?.emitFinal(text, language, confidence);
   }
 }
 
 class FakeTurnDetector implements TurnDetector {
-  readonly pushed: { frame: AudioFrame; partialText: string | null }[] = [];
+  readonly pushed: { frame: AudioFrame; partialText: string | null; selfPlayActive: boolean }[] = [];
   readonly #startHandlers = new Set<() => void>();
   readonly #endHandlers = new Set<() => void>();
 
-  push(frame: AudioFrame, partialText: string | null): void {
-    this.pushed.push({ frame, partialText });
+  push(frame: AudioFrame, partialText: string | null, selfPlayActive = false): void {
+    this.pushed.push({ frame, partialText, selfPlayActive });
   }
 
   onSpeechStart(cb: () => void): Unsubscribe {
@@ -316,6 +350,8 @@ const FRAME_MS = 20;
 
 class FakeVoice implements Voice {
   readonly spoken: string[] = [];
+  /** Every `language` argument this fake's synthesize() was actually called with. */
+  readonly languages: (string | undefined)[] = [];
   aborts = 0;
   prewarms = 0;
   closes = 0;
@@ -337,19 +373,75 @@ class FakeVoice implements Voice {
   async *synthesize(
     text: AsyncIterable<string>,
     signal: AbortSignal,
+    language?: string,
   ): AsyncIterable<AudioFrame> {
+    this.languages.push(language);
     if (signal.aborted) return;
     signal.addEventListener('abort', () => this.aborts++, { once: true });
 
     const samples = Math.round((this.#config.audio.deviceRate * FRAME_MS) / 1000);
-    for await (const sentence of text) {
-      if (signal.aborted) return;
-      this.spoken.push(sentence);
-      const frames = Math.max(1, Math.round((sentence.length * MS_PER_CHAR) / FRAME_MS));
-      for (let i = 0; i < frames; i++) {
+    const queue: AudioFrame[] = [];
+    let done = false;
+    let wake: (() => void) | undefined;
+    const notify = (): void => {
+      wake?.();
+      wake = undefined;
+    };
+
+    // Detached from the loop below, exactly like cartesia.ts's own `feeding`
+    // — pulls `text` eagerly, at its own pace, independent of whatever has
+    // actually been yielded/drained so far. The previous shape of this fake
+    // drove a single `for await (const sentence of text) { ...yield... }`
+    // loop directly, which cannot reproduce the concurrency relay() exists
+    // to fix: a real Voice's feed can run ahead of playback and keep a
+    // `.next()` call on `text` outstanding well after this generator itself
+    // has returned. Found in code review (2026-09-27) alongside the bugs
+    // that review caught: with the old shape, aborting while this fake was
+    // suspended waiting on the (not yet produced) NEXT sentence blocked
+    // `.return()` on this generator until that sentence eventually arrived
+    // — a fake-only artifact, since a real Voice's own yielding loop
+    // resolves on abort independent of its feed (see cartesia.ts:295-297).
+    const onAbort = (): void => {
+      done = true;
+      notify();
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    const feeding = (async () => {
+      for await (const sentence of text) {
         if (signal.aborted) return;
-        yield new Int16Array(samples).fill(1000);
+        this.spoken.push(sentence);
+        const frames = Math.max(1, Math.round((sentence.length * MS_PER_CHAR) / FRAME_MS));
+        for (let i = 0; i < frames; i++) {
+          if (signal.aborted) return;
+          queue.push(new Int16Array(samples).fill(1000));
+          notify();
+        }
       }
+      // The sentence source is exhausted (the turn's own answer is fully
+      // generated) — this is the ordinary "finished" path, distinct from
+      // `onAbort` above, and just as responsible for unblocking the drain
+      // loop below.
+      done = true;
+      notify();
+    })();
+    // Never an unhandled rejection just because this generator returned
+    // (aborted) before `feeding` itself noticed — same reasoning as
+    // cartesia.ts's own `void feeding`.
+    void feeding;
+
+    try {
+      for (;;) {
+        while (queue.length) {
+          if (signal.aborted) return;
+          yield queue.shift()!;
+        }
+        if (done) return;
+        await new Promise<void>((resolve) => {
+          wake = resolve;
+        });
+      }
+    } finally {
+      signal.removeEventListener('abort', onAbort);
     }
   }
 }

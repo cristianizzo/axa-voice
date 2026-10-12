@@ -130,3 +130,27 @@ test('aspetta does not stop, but is still a refusal for approvals', () => {
 test('empty and hallucinated input never stops', () => {
   for (const s of ['', '   ', '[Musica]', '(rumore)']) assert.equal(isStopCommand(s), false);
 });
+
+// --- English vocabulary (bug fix, 2026-09-27) -------------------------------
+//
+// After a mid-conversation language switch (director.ts's sticky #language),
+// natural English replies used to match nothing here at all — only Italian
+// vocabulary was recognised — so interpretApproval() returned 'unclear' for
+// an ordinary "yes"/"go ahead", denying the tool AND redispatching the bare
+// reply as a nonsensical new question.
+
+test('recognises clear English approval', () => {
+  for (const t of ['yes', 'Yes!', 'yeah', 'yep', 'sure', 'go ahead', 'do it', 'go for it', 'confirmed']) {
+    assert.equal(interpretApproval(t), 'yes', `should approve: ${t}`);
+  }
+});
+
+test('recognises clear English refusal', () => {
+  for (const t of ['no', 'No.', 'nope', 'nah', "don't", 'cancel', 'stop it', 'never mind']) {
+    assert.equal(interpretApproval(t), 'no', `should refuse: ${t}`);
+  }
+});
+
+test('an English yes buried in a longer sentence does not count', () => {
+  assert.notEqual(interpretApproval('I am not sure if yes or no'), 'yes');
+});

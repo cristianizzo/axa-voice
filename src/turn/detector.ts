@@ -10,6 +10,37 @@ import type { Config } from '../config.ts';
 const SPEECH_ONSET_RMS = 500;
 const SPEECH_CONTINUE_RMS = 200;
 
+/**
+ * Onset threshold used instead of `SPEECH_ONSET_RMS` while the Director is
+ * speaking through the same device (`selfPlayActive`, see `TurnDetector.push`'s
+ * doc comment). AEC's own measured attenuation ranges from +15.6 dB down to
+ * +0.7 dB depending on the content (spec 2026-09-11 §6) — nothing here can
+ * assume it removed the echo, only that it made it quieter on average. 3x
+ * approximates the weaker, more common end of that range in *linear* RMS
+ * terms (~9.5 dB): high enough that ordinary residual echo from the
+ * Director's own voice does not re-cross the bar it was just measured
+ * against, low enough that a user actually trying to interrupt — speaking
+ * into the mic at normal distance, not through a speaker and back — still
+ * clears it without having to raise their voice. It only ever gates the
+ * *onset*; once real speech is already recognised, `SPEECH_CONTINUE_RMS`
+ * governs same as any other utterance.
+ *
+ * That handoff is only fully safe in SPEAKING: a genuine barge-in there does
+ * flush playback (`#onSpeechStart` -> `#muteForBargeIn` in director.ts), so
+ * residual echo has nothing left to feed `SPEECH_CONTINUE_RMS` afterwards.
+ * `director.ts`'s `#onFrame` deliberately passes `audioOut.isPlaying()`
+ * rather than gating on `#state === 'SPEAKING'`, so this raised onset bar
+ * also applies while THINKING and AWAITING_APPROVAL — during a progress
+ * line or an approval question. In those two states `#onSpeechStart`
+ * returns without touching playback at all (AWAITING_APPROVAL) or leaves it
+ * running by design (THINKING, so talking during it can add to the
+ * conversation instead of destroying it). There, once the raised bar
+ * correctly suppresses a false onset, playback keeps running and residual
+ * echo only has to clear the much lower `SPEECH_CONTINUE_RMS` to keep
+ * refreshing "still speaking" and delay `onTurnEnd` until the line finishes.
+ */
+const SPEECH_ONSET_RMS_SELF_PLAY = 1500;
+
 /** Italian words that cannot end an utterance. */
 const TRAILING_CONJUNCTIONS = new Set([
   'e', 'ed', 'o', 'oppure', 'ma', 'però', 'che', 'se', 'quando', 'mentre',
@@ -67,10 +98,11 @@ export class VadTurnDetector implements TurnDetector {
     this.#now = opts.now ?? Date.now;
   }
 
-  push(frame: AudioFrame, partialText: string | null): void {
+  push(frame: AudioFrame, partialText: string | null, selfPlayActive = false): void {
     const now = this.#now();
     const level = rms(frame);
-    const isSpeech = level > (this.#speaking ? SPEECH_CONTINUE_RMS : SPEECH_ONSET_RMS);
+    const onsetRms = selfPlayActive ? SPEECH_ONSET_RMS_SELF_PLAY : SPEECH_ONSET_RMS;
+    const isSpeech = level > (this.#speaking ? SPEECH_CONTINUE_RMS : onsetRms);
 
     if (isSpeech) {
       this.#lastSpeechAt = now;

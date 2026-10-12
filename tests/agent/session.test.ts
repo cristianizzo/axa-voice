@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildOptions, ClaudeAgentSession } from '../../src/agent/session.ts';
+import { buildOptions, ClaudeAgentSession, WARM_UP_MESSAGE } from '../../src/agent/session.ts';
 import { loadConfig } from '../../src/config.ts';
 import type { AgentEvent } from '../../src/types.ts';
 
@@ -48,6 +48,14 @@ interface FakeSdk {
    * node:test's own dangling-promise detection at process exit.
    */
   releaseInterrupts(): void;
+  /** Every mode setPermissionMode() was called with, in order. */
+  permissionModes: string[];
+  /**
+   * Models the real CLI's single-ordered-turn-stream constraint: when set,
+   * the fake will not read (and act on) message N+1 until a `result` for
+   * message N has been reported via emit().
+   */
+  strictTurnOrdering: boolean;
 }
 
 function makeFakeSdk(): FakeSdk {
@@ -65,14 +73,34 @@ function makeFakeSdk(): FakeSdk {
     autoAnswerWarmUp: true,
     hangInterrupt: false,
     rejectInterrupt: false,
+    permissionModes: [] as string[],
+    strictTurnOrdering: false,
   };
 
   const wake = (): void => {
     notify?.();
     notify = undefined;
   };
+  // Only meaningful while state.strictTurnOrdering is on: gates the fake's
+  // consumption loop so it never reads a turn N+1 before turn N's own result
+  // has been reported, mirroring the real CLI's single ordered stream.
+  let resultPending = false;
+  let resultWaiters: Array<() => void> = [];
+  const waitUntilResultReported = (): Promise<void> => {
+    if (!resultPending) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      resultWaiters.push(resolve);
+    });
+  };
+  const reportResult = (): void => {
+    resultPending = false;
+    const waiters = resultWaiters;
+    resultWaiters = [];
+    for (const resolve of waiters) resolve();
+  };
   const emit = (message: unknown): void => {
     queued.push(message);
+    if (state.strictTurnOrdering && (message as { type?: string }).type === 'result') reportResult();
     wake();
   };
   const hungInterrupts: Array<() => void> = [];
@@ -130,6 +158,9 @@ function makeFakeSdk(): FakeSdk {
       if (state.resultOnInterrupt) emit({ type: 'result', subtype: 'error_during_execution' });
       return undefined;
     },
+    async setPermissionMode(mode: string): Promise<void> {
+      state.permissionModes.push(mode);
+    },
   };
 
   const startupFn = async (params: { options?: Record<string, unknown> }) => {
@@ -138,8 +169,16 @@ function makeFakeSdk(): FakeSdk {
       query(prompt: AsyncIterable<{ message: { content: string } }>) {
         void (async () => {
           let first = true;
-          for await (const turn of prompt) {
-            state.prompts.push(turn.message.content);
+          const iterator = prompt[Symbol.asyncIterator]();
+          for (;;) {
+            // The real CLI processes turns over a single ordered stream: it
+            // will not start on a new one before the previous one's result
+            // has been reported.
+            if (state.strictTurnOrdering) await waitUntilResultReported();
+            const next = await iterator.next();
+            if (next.done) return;
+            state.prompts.push(next.value.message.content);
+            if (state.strictTurnOrdering) resultPending = true;
             // start()'s warm-up is always the first message pushed to a fresh
             // session; answer it immediately so tests do not have to know it
             // happened at all unless they are specifically testing for it.
@@ -204,7 +243,31 @@ function makeFakeSdk(): FakeSdk {
     releaseInterrupts() {
       while (hungInterrupts.length > 0) hungInterrupts.pop()?.();
     },
+    get permissionModes() {
+      return state.permissionModes;
+    },
+    get strictTurnOrdering() {
+      return state.strictTurnOrdering;
+    },
+    set strictTurnOrdering(value: boolean) {
+      state.strictTurnOrdering = value;
+    },
   };
+}
+
+/**
+ * Reads the PreToolUse hook the session registered with start(), the same
+ * way the tests already read sdk.options?.canUseTool directly, and returns a
+ * function that invokes it with no arguments (the session's own hook ignores
+ * them, see session.ts #denyToolsWhileSuppressed).
+ */
+function getPreToolUseDecision(sdk: FakeSdk): () => Promise<unknown> {
+  const hooks = sdk.options?.hooks as
+    | { PreToolUse?: Array<{ hooks: Array<() => Promise<unknown>> }> }
+    | undefined;
+  const hook = hooks?.PreToolUse?.[0]?.hooks?.[0];
+  if (!hook) throw new Error('no PreToolUse hook registered on sdk.options');
+  return () => hook();
 }
 
 function textDelta(text: string): unknown {
@@ -225,7 +288,12 @@ async function settle(times = 6): Promise<void> {
 
 async function startSession(
   sdk: FakeSdk,
-  overrides: Partial<{ approvalTimeoutMs: number; interruptDrainMs: number; turnTimeoutMs: number }> = {},
+  overrides: Partial<{
+    approvalTimeoutMs: number;
+    interruptDrainMs: number;
+    turnTimeoutMs: number;
+    staleResultWindowMs: number;
+  }> = {},
 ): Promise<ClaudeAgentSession> {
   const cfg =
     overrides.approvalTimeoutMs ?? overrides.turnTimeoutMs
@@ -241,14 +309,17 @@ async function startSession(
   const session = new ClaudeAgentSession(cfg, {
     startupFn: sdk.startupFn,
     interruptDrainMs: overrides.interruptDrainMs,
+    staleResultWindowMs: overrides.staleResultWindowMs,
   });
   await session.start();
   await settle();
   // start()'s own warm-up message is real traffic (spec: session.ts #warmUp),
   // but tests that predate it assert prompts() against exactly the turns
   // they themselves sent. Drop it here, once, rather than teach every test
-  // about a message none of them are about.
+  // about a message none of them are about. Same for the plan-mode entry/exit
+  // pair the warm-up itself causes (spec: session.ts #enterPlanMode).
   sdk.prompts.length = 0;
+  sdk.permissionModes.length = 0;
   return session;
 }
 
@@ -456,7 +527,7 @@ test('start() sends exactly one throwaway message before resolving', async () =>
   await session.start();
   await settle();
 
-  assert.deepEqual(sdk.prompts, ['.'], 'start() must push exactly one throwaway message');
+  assert.deepEqual(sdk.prompts, [WARM_UP_MESSAGE], 'start() must push exactly one throwaway message');
   await session.close();
 });
 
@@ -475,7 +546,7 @@ test('the warm-up message never reaches a real send() as an event', async () => 
     { type: 'text', delta: 'Ciao.' },
     { type: 'done' },
   ]);
-  assert.deepEqual(sdk.prompts, ['.', 'ciao'], 'the warm-up turn precedes the real one, once');
+  assert.deepEqual(sdk.prompts, [WARM_UP_MESSAGE, 'ciao'], 'the warm-up turn precedes the real one, once');
   await session.close();
 });
 
@@ -685,6 +756,414 @@ test('a warm-up give-up interrupts the CLI, so its belated stream events never r
   await session.close();
 });
 
+test(
+  'two overlapping ghost turns are each independently swallowed, neither bleeding into a third real turn',
+  async () => {
+    // The bug this guards against: #staleResult used to be a single
+    // timer/slot, but two give-ups can each owe a ghost at once — here, the
+    // warm-up's give-up owes R1, and a LATER turn's interrupt() give-up owes
+    // R2 before R1's belated result has even landed. With a single shared
+    // slot, consuming R1's result via #takeStaleResult cleared the whole
+    // quarantine, so R2's still-outstanding belated tail would then leak
+    // straight into whatever real turn (T3) had since started. #staleResults
+    // is now a counter: consuming one ghost must only release ITS OWN slot,
+    // leaving the other one armed.
+    const sdk = makeFakeSdk();
+    sdk.autoAnswerWarmUp = false; // the warm-up's throwaway message is never answered
+    sdk.resultOnInterrupt = false; // no interrupt() ever auto-acks with a result
+
+    const fast = {
+      ...config,
+      director: { ...config.director, turnTimeoutMs: 50 },
+    } as never;
+    const session = new ClaudeAgentSession(fast, {
+      startupFn: sdk.startupFn,
+      interruptDrainMs: 80,
+      staleResultWindowMs: 5000, // must not fire mid-test
+    });
+
+    // --- Ghost #1: the warm-up gives up, owing R1's belated result. ---
+    const starting = session.start();
+    await settle();
+    await new Promise((resolve) => setTimeout(resolve, 60)); // past turnTimeoutMs
+    await settle();
+    await new Promise((resolve) => setTimeout(resolve, 120)); // past interruptDrainMs
+    await settle();
+    await starting; // start() resolves with R1 still owed
+    sdk.prompts.length = 0;
+
+    // --- A real turn (T2) starts, then is itself interrupted and gives up
+    // in turn, owing a second ghost, R2 -- while R1 is STILL outstanding. ---
+    const t2 = drain(session.send('seconda'));
+    await settle();
+    sdk.emit(textDelta("C'era una volta"));
+    await settle();
+    await session.interrupt(); // resultOnInterrupt is false: this too times out and gives up, owing R2
+    await t2;
+
+    // --- A third, genuinely new turn (T3) starts, reassigning #turn away
+    // from both ghosts. ---
+    const t3 = drain(session.send('terza'));
+    await settle();
+
+    // R1's belated tail lands first...
+    sdk.emit(textDelta('R1 leaked'));
+    sdk.emit({ type: 'result', subtype: 'error_during_execution' }); // R1's belated result
+    await settle();
+
+    // ...and only now does R2's belated tail land. With a single shared slot,
+    // consuming R1's result above would already have cleared the whole
+    // quarantine, letting this leak straight into T3.
+    sdk.emit(textDelta('R2 leaked'));
+    sdk.emit({ type: 'result', subtype: 'error_during_execution' }); // R2's belated result
+    await settle();
+
+    // T3's own, genuine reply.
+    sdk.emit(textDelta('Risposta T3.'));
+    sdk.emit(RESULT);
+
+    const deltas = (await t3).filter((e) => e.type === 'text').map((e) => e.delta);
+    assert.deepEqual(
+      deltas,
+      ['Risposta T3.'],
+      'neither ghost (R1 nor R2) may leak into T3, even though R1 was consumed first',
+    );
+    await session.close();
+  },
+);
+
+test(
+  "a ghost's own timer firing after it was already consumed early must not phantom-release a sibling " +
+    'ghost still genuinely owed',
+  async () => {
+    // Regression for the round-6 bug: #armStaleResult() scheduled an unref'd
+    // setTimeout per ghost but never kept the handle, so #takeStaleResult()
+    // consuming a ghost EARLY (before its own window elapsed) could not cancel
+    // that ghost's timer. Left alive, the timer fired anyway later, calling
+    // #releaseStaleResult() a SECOND time for a single ghost (A). If a second,
+    // genuinely still-outstanding ghost (B) had been armed in the meantime,
+    // that phantom decrement zeroed #staleResults early — restoring default
+    // mode and, worse, meant #emit()/#dispatch no longer recognised B's own
+    // still-owed belated tail as stale: its text deltas would leak into
+    // whatever real turn (T3) was running concurrently, and its belated
+    // `result` would be misattributed to T3 as a genuine failure (#dispatch's
+    // `error_during_execution` branch). staleResultWindowMs is short (400ms,
+    // unlike the 5000ms used elsewhere purely to test the counter arithmetic)
+    // so A's timer actually gets a chance to fire mid-test.
+    const sdk = makeFakeSdk();
+    sdk.autoAnswerWarmUp = false; // the warm-up's throwaway message is never answered
+    sdk.resultOnInterrupt = false; // no interrupt() ever auto-acks with a result
+
+    const fast = {
+      ...config,
+      director: { ...config.director, turnTimeoutMs: 50 },
+    } as never;
+    const session = new ClaudeAgentSession(fast, {
+      startupFn: sdk.startupFn,
+      interruptDrainMs: 50,
+      staleResultWindowMs: 400,
+    });
+
+    // --- Ghost A: the warm-up gives up, arming A's slot and starting A's own
+    // 400ms timer. ---
+    const starting = session.start();
+    await settle();
+    await new Promise((resolve) => setTimeout(resolve, 70)); // past turnTimeoutMs
+    await settle();
+    await new Promise((resolve) => setTimeout(resolve, 70)); // past interruptDrainMs
+    await settle();
+    await starting; // start() resolves with A still owed
+    sdk.prompts.length = 0;
+    const armedAt = Date.now();
+    assert.deepEqual(
+      sdk.permissionModes,
+      ['plan'],
+      'the warm-up give-up must have entered plan mode and not yet exited it',
+    );
+
+    // --- A's belated result lands EARLY, well inside its own 400ms window,
+    // consumed via #takeStaleResult. With the fix this cancels A's own timer
+    // outright; with the bug, A's original setTimeout is still live regardless
+    // and will fire again later on its own schedule. Since A was the only
+    // ghost owed, consuming it also restores default mode immediately. ---
+    sdk.emit({ type: 'result', subtype: 'error_during_execution' }); // A's belated result, consumed early
+    await settle();
+    assert.deepEqual(
+      sdk.permissionModes,
+      ['plan', 'default'],
+      "consuming the only outstanding ghost (A) must restore default mode right away",
+    );
+
+    // A deliberate gap before B is armed: keeps B's own 400ms window (which
+    // starts when IT is armed, below) comfortably separated in absolute time
+    // from A's -- otherwise the margin needed to clear A's window risks
+    // running past B's own and confusing a genuine, non-buggy expiry of B's
+    // timer with the phantom release this test exists to catch.
+    await new Promise((resolve) => setTimeout(resolve, 150));
+
+    // --- Ghost B: a real turn (T2) starts, then is itself interrupted and
+    // gives up in turn, arming a second slot -- comfortably before A's
+    // original 400ms window has elapsed. ---
+    const t2 = drain(session.send('seconda'));
+    await settle();
+    sdk.emit(textDelta("C'era una volta"));
+    await settle();
+    await session.interrupt(); // resultOnInterrupt is false: this too times out and arms B
+    await t2;
+    const armedAtB = Date.now(); // B's own 400ms window starts roughly here
+    assert.ok(
+      armedAtB - armedAt < 400,
+      "test invariant: B must be armed before A's own original timer would fire",
+    );
+    assert.deepEqual(
+      sdk.permissionModes,
+      ['plan', 'default', 'plan'],
+      'B being armed via interrupt() must re-enter plan mode',
+    );
+
+    // --- Wait just past A's original 400ms window (measured from armedAt),
+    // but well short of B's OWN 400ms window (measured from armedAtB, which
+    // is later than armedAt): the margin here must clear the first without
+    // ever risking the second, or a genuine, non-buggy expiry of B's own
+    // timer would land in the same gap and produce an indistinguishable
+    // "default" entry. If A's timer was never cancelled (the bug), it fires
+    // within this window and phantom-decrements the counter a second time for
+    // A alone -- but only B is genuinely outstanding at this point, so that
+    // phantom decrement would zero the counter early and restore default mode
+    // well before B's own belated tail has arrived. ---
+    const sinceA = armedAtB - armedAt;
+    const waitMs = Math.max(0, 400 - sinceA) + 40;
+    assert.ok(
+      waitMs < 400 - 100,
+      "test invariant: the wait must clear only A's window, not risk B's own 400ms window too",
+    );
+    await new Promise((resolve) => setTimeout(resolve, waitMs));
+    assert.deepEqual(
+      sdk.permissionModes,
+      ['plan', 'default', 'plan'],
+      "A's timer firing after its own early consumption must not release B's still-outstanding slot " +
+        '(a fourth, premature "default" entry here would be exactly that bug)',
+    );
+
+    // --- A genuinely new turn (T3) starts while B is still owed, reassigning
+    // #turn away from it. send() itself proactively exits plan mode for any
+    // new turn regardless of the stale-result counter (see send()'s own
+    // comment) -- that is unrelated to this bug and expected either way. ---
+    const t3 = drain(session.send('terza'));
+    await settle();
+
+    // B's belated tail lands now -- must still be swallowed by the (still
+    // outstanding, un-corrupted) counter, not leaked into T3.
+    sdk.emit(textDelta('B leaked'));
+    sdk.emit({ type: 'result', subtype: 'error_during_execution' }); // B's belated result
+    await settle();
+
+    // T3's own, genuine reply.
+    sdk.emit(textDelta('Risposta T3.'));
+    sdk.emit(RESULT);
+
+    const deltas = (await t3).filter((e) => e.type === 'text').map((e) => e.delta);
+    assert.deepEqual(
+      deltas,
+      ['Risposta T3.'],
+      "B's belated tail must never leak into T3, even after A's own timer fired in the background",
+    );
+    await session.close();
+  },
+);
+
+// --- Tool suppression during a give-up --------------------------------------
+//
+// WebSearch/WebFetch/ToolSearch sit in allowedTools (spec §8/buildOptions),
+// which means they skip canUseTool entirely, and a real in-flight HTTP call
+// cannot be reliably stopped by interrupt(). Layered on top of the explicit
+// WARM_UP_MESSAGE instruction not to use any tool: 'plan' mode
+// (#enterPlanMode/#exitPlanMode) and, backing it up, a PreToolUse hook
+// (#denyToolsWhileSuppressed) that the SDK's own docs recommend as the one
+// gate that runs before every tool call regardless of allowedTools.
+
+test('warm-up enters plan mode before the throwaway message and exits once it settles normally', async () => {
+  const sdk = makeFakeSdk();
+  const session = new ClaudeAgentSession(config, { startupFn: sdk.startupFn });
+  await session.start();
+  await settle();
+
+  assert.deepEqual(sdk.prompts, [WARM_UP_MESSAGE]);
+  assert.deepEqual(
+    sdk.permissionModes,
+    ['plan', 'default'],
+    'plan mode must be entered before the message is pushed and exited once the turn settles',
+  );
+  await session.close();
+});
+
+test(
+  'a warm-up that never gets a result keeps tool suppression armed, but the quarantine window itself ' +
+    'eventually restores default mode',
+  async () => {
+    const sdk = makeFakeSdk();
+    sdk.autoAnswerWarmUp = false; // the model never answers the throwaway message
+    sdk.resultOnInterrupt = false; // ...and no result for the abandoned turn ever arrives, period
+
+    const fast = {
+      ...config,
+      director: { ...config.director, turnTimeoutMs: 30, interruptTimeoutMs: 30 },
+    } as never;
+    const session = new ClaudeAgentSession(fast, {
+      startupFn: sdk.startupFn,
+      interruptDrainMs: 30,
+      staleResultWindowMs: 60,
+    });
+
+    await session.start();
+    assert.deepEqual(
+      sdk.permissionModes,
+      ['plan'],
+      'neither interrupt() nor the drain confirmed completion, so suppression must stay armed',
+    );
+
+    const decision = getPreToolUseDecision(sdk);
+    const denied = (await decision()) as { hookSpecificOutput?: { permissionDecision?: string } };
+    assert.equal(denied.hookSpecificOutput?.permissionDecision, 'deny', 'a tool call mid give-up must be refused');
+
+    // Real margin past staleResultWindowMs: no belated result ever arrives at all.
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    assert.deepEqual(
+      sdk.permissionModes,
+      ['plan', 'default'],
+      "the quarantine timer's own expiry must restore default mode even with nothing to react to",
+    );
+    const allowed = (await decision()) as { hookSpecificOutput?: unknown };
+    assert.equal(allowed.hookSpecificOutput, undefined, 'the hook must allow again once suppression clears');
+
+    await session.close();
+  },
+);
+
+test('interrupt() enters plan mode and exits promptly once the killed turn is confirmed done', async () => {
+  const sdk = makeFakeSdk();
+  const session = await startSession(sdk);
+  const events = drain(session.send('racconta'));
+  await settle();
+  sdk.emit(textDelta("C'era una volta"));
+  await settle();
+
+  await session.interrupt();
+  assert.deepEqual(
+    sdk.permissionModes,
+    ['plan', 'default'],
+    'a confirmed interrupt must restore default mode promptly, not wait out the full quarantine window',
+  );
+  await events;
+  await session.close();
+});
+
+test(
+  "interrupt() whose drain never confirms completion leaves suppression armed until the quarantine " +
+    'window elapses',
+  async () => {
+    const sdk = makeFakeSdk();
+    sdk.resultOnInterrupt = false; // the CLI never acks the interrupt with a result
+    const session = await startSession(sdk, { interruptDrainMs: 30, staleResultWindowMs: 60 });
+
+    const events = drain(session.send('racconta'));
+    await settle();
+    sdk.emit(textDelta("C'era una volta"));
+    await settle();
+
+    await session.interrupt();
+    assert.deepEqual(
+      sdk.permissionModes,
+      ['plan'],
+      'no result ever confirmed the killed turn was done, so suppression must stay armed',
+    );
+    await events; // #endTurn ended the turn locally even though no result ever came
+
+    await new Promise((resolve) => setTimeout(resolve, 120)); // past staleResultWindowMs, with margin
+    assert.deepEqual(sdk.permissionModes, ['plan', 'default'], 'the quarantine window itself must restore default mode');
+
+    await session.close();
+  },
+);
+
+test('the PreToolUse hook allows an ordinary tool call when nothing is suppressed', async () => {
+  const sdk = makeFakeSdk();
+  const session = await startSession(sdk);
+
+  const decision = getPreToolUseDecision(sdk);
+  const result = (await decision()) as { hookSpecificOutput?: unknown };
+  assert.equal(result.hookSpecificOutput, undefined, 'a tool call outside any give-up must not be touched');
+  await session.close();
+});
+
+test('a completely ordinary turn causes no setPermissionMode calls at all', async () => {
+  const sdk = makeFakeSdk();
+  const session = await startSession(sdk); // resets sdk.permissionModes past the warm-up's own plan/default pair
+  const events = drain(session.send('ciao'));
+  await settle();
+  sdk.emit(textDelta('Ciao.'));
+  sdk.emit(RESULT);
+  await events;
+
+  assert.deepEqual(
+    sdk.permissionModes,
+    [],
+    'a turn that neither warms up nor gives up must never touch permission mode',
+  );
+  await session.close();
+});
+
+test("send() clears a stale quarantine's tool suppression instead of holding the new turn hostage to it", async () => {
+  // Deliberately does not drive the new turn to a result: the abandoned
+  // warm-up turn's own belated result never arrives either (by construction,
+  // to keep #suppressTools armed well past send()), and #staleResult's own
+  // "single ordered stream" invariant (spec: session.ts STALE_RESULT_WINDOW_MS)
+  // means a result that never comes is a separate, already-accepted hazard of
+  // the quarantine timer itself — not something send()'s defensive
+  // suppressTools check claims to fix. This test is only about that one
+  // check: tool suppression must not survive into a turn that has already
+  // started.
+  const sdk = makeFakeSdk();
+  sdk.autoAnswerWarmUp = false; // the model never answers the throwaway warm-up message
+  sdk.resultOnInterrupt = false; // and the interrupt that follows is never acked either
+
+  const fast = {
+    ...config,
+    director: { ...config.director, turnTimeoutMs: 30, interruptTimeoutMs: 30 },
+  } as never;
+  const session = new ClaudeAgentSession(fast, {
+    startupFn: sdk.startupFn,
+    interruptDrainMs: 30,
+    staleResultWindowMs: 5000, // must not fire during this test
+  });
+  await session.start();
+  assert.deepEqual(
+    sdk.permissionModes,
+    ['plan'],
+    'the give-up path must leave suppression armed, waiting on a quarantine that will not expire in time',
+  );
+
+  const decision = getPreToolUseDecision(sdk);
+  const deniedBefore = (await decision()) as { hookSpecificOutput?: { permissionDecision?: string } };
+  assert.equal(deniedBefore.hookSpecificOutput?.permissionDecision, 'deny', 'suppression must be armed before send()');
+
+  void drain(session.send('ciao davvero')).catch(() => {});
+  await settle();
+  assert.deepEqual(
+    sdk.permissionModes,
+    ['plan', 'default'],
+    "send()'s own defensive check must clear a stale quarantine's suppression rather than wait out its window",
+  );
+  const allowedAfter = (await decision()) as { hookSpecificOutput?: unknown };
+  assert.equal(
+    allowedAfter.hookSpecificOutput,
+    undefined,
+    'a legitimate new turn must not be silently held in no-tool-execution mode',
+  );
+
+  await session.close();
+});
+
 // --- One long-lived session ------------------------------------------------
 
 test('the first turn is not lost to the input stream being slow to start', async () => {
@@ -810,6 +1289,51 @@ test('interrupt() gives up draining rather than blocking barge-in forever', asyn
   const started = Date.now();
   await session.interrupt();
   assert.ok(Date.now() - started < 500, 'the microphone is already open; nothing may block here');
+  await session.close();
+});
+
+test('a public interrupt() whose query.interrupt() rejects still resolves instead of throwing', async () => {
+  // Mirrors the warm-up "interrupt() rejects" case above, but exercises the
+  // public interrupt() method directly: every other call into the SDK's
+  // control protocol in this file (#enterPlanMode, #exitPlanMode, #warmUp's
+  // give-up path) is wrapped in .catch(() => undefined). interrupt() itself
+  // was the one exception — a real, already-tested failure mode
+  // ("control request failed: session not initialized") would reject the
+  // Promise.all it sits in, and every caller in director.ts either doesn't
+  // catch it or awaits it unguarded, so this surfaced as an unhandled
+  // rejection that took the whole process down via cli.ts's global handler.
+  const sdk = makeFakeSdk();
+  sdk.rejectInterrupt = true; // interrupt() rejects instead of hanging or resolving
+  const session = await startSession(sdk);
+
+  const events = drain(session.send('raccontami una storia'));
+  await settle();
+  sdk.emit(textDelta("C'era una volta"));
+  await settle();
+
+  await assert.doesNotReject(
+    () => session.interrupt(),
+    'a rejecting query.interrupt() must not propagate out of the public interrupt()',
+  );
+  assert.equal(sdk.interrupts, 1);
+
+  // interrupt() rejected before it could emit the cut turn's own result, so
+  // the drain also times out and the give-up path arms the stale-result
+  // quarantine. Feed it the belated result so the quarantine clears rather
+  // than swallowing the next turn.
+  sdk.emit({ type: 'result', subtype: 'error_during_execution' });
+  await settle();
+  await events;
+
+  // The session must still be usable afterwards.
+  const next = drain(session.send('ciao'));
+  await settle();
+  sdk.emit(textDelta('Ciao.'));
+  sdk.emit(RESULT);
+  assert.deepEqual(await next, [
+    { type: 'text', delta: 'Ciao.' },
+    { type: 'done' },
+  ]);
   await session.close();
 });
 
@@ -996,6 +1520,107 @@ test('a read-only tool reaching the callback is asked about, not assumed impossi
   const result = await canUseTool('WebFetch', { url: 'https://example.com' }, {});
   assert.ok(asked, 'a pre-approved tool can still prompt');
   assert.equal(result.behavior, 'allow');
+  await session.close();
+});
+
+test('dispatching a subagent is auto-approved without a spoken yes', async () => {
+  // 'Agent' is the SDK's real tool name for a subagent dispatch (sdk.d.ts:
+  // Options.agents docs, "invoked via the Agent tool"). Dispatch alone is
+  // inert; whatever the subagent's own tools go on to do still hits this
+  // same canUseTool individually (see the comment in session.ts).
+  const sdk = makeFakeSdk();
+  const session = await startSession(sdk);
+  let asked = false;
+  session.onPermissionRequest(async () => {
+    asked = true;
+    return false; // even a spoken "no" must not matter: handlePermission must not run at all
+  });
+
+  const canUseTool = sdk.options?.canUseTool as (
+    tool: string,
+    input: Record<string, unknown>,
+    opts: unknown,
+  ) => Promise<{ behavior: string; updatedInput?: Record<string, unknown> }>;
+
+  const input = { description: 'Search jobs', prompt: 'cerca web3 developer jobs', subagent_type: 'job-hunter' };
+  const result = await canUseTool('Agent', input, {});
+  assert.equal(result.behavior, 'allow');
+  assert.deepEqual(result.updatedInput, input, 'the dispatch call must not be rewritten');
+  assert.equal(asked, false, 'the approval flow must be skipped entirely, not answered');
+  await session.close();
+});
+
+test('a subagent dispatch still leaves its own tool calls gated', async () => {
+  // Approving the dispatch must not become a blanket approval: a Write call
+  // the subagent itself makes is a distinct canUseTool invocation and still
+  // needs a spoken yes.
+  const sdk = makeFakeSdk();
+  const session = await startSession(sdk);
+  let asked = 0;
+  session.onPermissionRequest(async () => {
+    asked += 1;
+    return true;
+  });
+
+  const canUseTool = sdk.options?.canUseTool as (
+    tool: string,
+    input: Record<string, unknown>,
+    opts: unknown,
+  ) => Promise<{ behavior: string }>;
+
+  const dispatch = await canUseTool('Agent', { description: 'x', prompt: 'y', subagent_type: 'general-purpose' }, {});
+  const write = await canUseTool('Write', { file_path: '/tmp/x' }, {});
+  assert.equal(dispatch.behavior, 'allow');
+  assert.equal(write.behavior, 'allow');
+  assert.equal(asked, 1, 'only the Write call goes through the spoken-approval flow');
+  await session.close();
+});
+
+// --- Debug -------------------------------------------------------------------
+
+test('the injected debug callback wires up the SDK stderr option and traces the pipeline', async () => {
+  const sdk = makeFakeSdk();
+  const lines: string[] = [];
+  const session = new ClaudeAgentSession(config, {
+    startupFn: sdk.startupFn,
+    debug: (message) => lines.push(message),
+  });
+  await session.start();
+  await settle();
+
+  // The SDK's own stderr callback (sdk.d.ts Options.stderr) must be wired to
+  // the same injected debug callback, not left unset.
+  const stderr = sdk.options?.stderr as ((data: string) => void) | undefined;
+  assert.equal(typeof stderr, 'function');
+  stderr?.('some cli stderr output');
+  assert.ok(lines.some((line) => line.includes('cli stderr: some cli stderr output')));
+
+  // The turn pipeline traced at least start-up and warm-up.
+  assert.ok(lines.some((line) => line.includes('starting claude CLI subprocess')));
+  assert.ok(lines.some((line) => line.includes('warm-up starting')));
+
+  lines.length = 0;
+  // Only start consuming: the generator body runs up to its first await/yield
+  // on the first next() call, which is enough to see the entry log fire.
+  const iterator = session.send('ciao')[Symbol.asyncIterator]();
+  const pending = iterator.next();
+  await settle();
+  assert.ok(lines.some((line) => line.includes('send() called, pushing turn')));
+
+  sdk.emit(RESULT);
+  await pending;
+  await session.close();
+});
+
+test('with no debug callback injected, nothing is logged (no-op by default)', async () => {
+  const sdk = makeFakeSdk();
+  // No debug option passed at all — mirrors production with AXA_DEBUG unset.
+  const session = new ClaudeAgentSession(config, { startupFn: sdk.startupFn });
+  await session.start();
+  await settle();
+  const stderr = sdk.options?.stderr as ((data: string) => void) | undefined;
+  // Must not throw even though nothing is listening.
+  assert.doesNotThrow(() => stderr?.('noise'));
   await session.close();
 });
 
