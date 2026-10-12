@@ -1,0 +1,11 @@
+{
+  "name": "axa-voice",
+  "version": "0.1.0",
+  "description": "Launch the axa-voice voice assistant (mic in, speaker out) as a background process from within Claude Code.",
+  "author": {
+    "name": "cristianizzo"
+  },
+  "homepage": "https://github.com/cristianizzo/axa-voice",
+  "license": "UNLICENSED",
+  "keywords": ["voice", "audio", "assistant"]
+}
