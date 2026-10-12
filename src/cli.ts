@@ -1,4 +1,5 @@
 import { access, constants } from 'node:fs/promises';
+import { emitKeypressEvents } from 'node:readline';
 import { loadConfig } from './config.ts';
 import { AudioDevice } from './audio/device.ts';
 import { WhisperServer } from './stt/server.ts';
@@ -8,6 +9,7 @@ import { ClaudeAgentSession } from './agent/session.ts';
 import { CartesiaVoice } from './voice/cartesia.ts';
 import { SentenceSpeechFilter } from './filter/speech-filter.ts';
 import { Director } from './director/director.ts';
+import { runGuiCommand } from './system/gui.ts';
 
 const envFile = new URL('../.env', import.meta.url);
 try {
@@ -34,19 +36,36 @@ async function checkHelper(): Promise<void> {
 
 const whisper = new WhisperServer(config);
 const device = new AudioDevice(config);
-const agent = new ClaudeAgentSession(config);
+const agent = new ClaudeAgentSession(config, {
+  // Off by default, same reasoning as the Director's own `debug` dep below:
+  // the failure this exists to diagnose was a silent process, not a noisy
+  // one. Set AXA_DEBUG=1 to trace the turn pipeline step by step, and to see
+  // the underlying `claude` CLI subprocess's own stderr.
+  debug: process.env.AXA_DEBUG ? console.error : undefined,
+});
 const voice = new CartesiaVoice(config);
 
 const director = new Director({
   config,
   audioIn: device,
   audioOut: device,
-  transcriber: new WhisperTranscriber(config),
+  // Dumps the exact audio sent for each turn's final transcription, so a live
+  // mistranscription can be replayed offline instead of guessed at (spec: the
+  // 2026-09-23 garbled-English report, which an isolated fixture test could
+  // not reproduce).
+  transcriber: new WhisperTranscriber(config, {
+    dumpDir: process.env.AXA_DEBUG ? new URL('../debug-audio/', import.meta.url).pathname : undefined,
+    // Off by default, same reasoning as the Director's own `debug` dep below:
+    // the failure this exists to diagnose was a silent process, not a noisy
+    // one. Set AXA_DEBUG=1 to see #final() give up, and why.
+    debug: process.env.AXA_DEBUG ? console.error : undefined,
+  }),
   turns: new VadTurnDetector(config),
   agent,
   voice,
   filter: new SentenceSpeechFilter(),
-  onError: (message) => console.error(`\n[audio] ${message}`),
+  runGui: (mode) => runGuiCommand(config.gui.scriptPath, mode),
+  onError: (message) => console.error(`\n\x1b[31m[audio] ${message}\x1b[0m`),
   // Off by default: the failure this exists to diagnose was a silent process,
   // not a noisy one. Set AXA_DEBUG=1 to get the per-turn trace back.
   debug: process.env.AXA_DEBUG ? console.error : undefined,
@@ -68,11 +87,11 @@ process.on('SIGTERM', () => void shutdown(0));
 // shutdown above and leaves exactly the orphans it exists to prevent: a stray
 // helper holding the microphone, a whisper-server holding port 8178.
 process.on('uncaughtException', (error) => {
-  console.error(`\nerrore non gestito: ${error.stack ?? error.message}\n`);
+  console.error(`\n\x1b[31merrore non gestito: ${error.stack ?? error.message}\x1b[0m\n`);
   void shutdown(1);
 });
 process.on('unhandledRejection', (reason) => {
-  console.error(`\npromise rifiutata e non gestita: ${String(reason)}\n`);
+  console.error(`\n\x1b[31mpromise rifiutata e non gestita: ${String(reason)}\x1b[0m\n`);
   void shutdown(1);
 });
 
@@ -81,11 +100,52 @@ try {
   console.log('avvio whisper…');
   await whisper.start();
   console.log('scaldo la sessione…');
-  await agent.start(); // ~900ms, must not land on the first turn (spec §4)
+  // Pays for the subprocess spawn AND a full warm-up model round trip, so
+  // neither lands on the user's first real turn (spec §4). Normally a second
+  // or so, but on the warm-up's give-up path this can take up to
+  // config.director.interruptTimeoutMs (session.ts #enterPlanMode, entered
+  // BEFORE the throwaway message is even pushed) + config.director.turnTimeoutMs
+  // (waiting on the message itself) + config.director.interruptTimeoutMs again
+  // (the interrupt() call that follows the give-up) + the interrupt drain
+  // (3 s + 45 s + 3 s + 2 s = 53 s in production) before resolving. Every step
+  // of that path — the plan-mode wait, the turn wait, the interrupt() call
+  // itself, and the drain — is now individually bounded (session.ts #warmUp),
+  // so this is a genuine worst case, not a hang: an interrupt() that never
+  // returns used to be able to block this forever instead.
+  await agent.start();
   console.log('apro il microfono…');
   await director.start();
-  console.log('pronto. parla pure.  (ctrl-c per uscire)');
+  console.log('pronto. parla pure.  (ctrl-c per uscire, barra spaziatrice per silenziare)');
+
+  // Manual mic mute: a background tool call can run long enough that a nearby
+  // conversation not meant for Axa gets treated as a follow-up, and the mic
+  // itself is the only thing that can reliably say "not talking to you" while
+  // the agent is busy. Keypress, not a spoken command, on purpose — it must
+  // not depend on the very channel it is meant to silence.
+  if (process.stdin.isTTY) {
+    emitKeypressEvents(process.stdin);
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+    // Raw mode stops the terminal from turning Ctrl-C into SIGINT itself, so
+    // the existing shutdown path has to be re-armed here or the app becomes
+    // unkillable the moment muting is available.
+    process.stdin.on('keypress', (_str, key: { name?: string; ctrl?: boolean } | undefined) => {
+      if (key?.ctrl && key.name === 'c') {
+        void shutdown(0);
+        return;
+      }
+      if (key?.name === 'space') {
+        director.setMuted(!director.muted);
+        // The toggle also plays a spoken confirmation, but that depends on
+        // the TTS/voice pipeline actually working — the one thing this key
+        // exists to work around not depending on. A plain, always-on line
+        // (no AXA_DEBUG gate) is the fallback that still tells the user the
+        // mic state changed even if audio output is silent or broken.
+        console.log(director.muted ? 'microfono: OFF' : 'microfono: ON');
+      }
+    });
+  }
 } catch (error) {
-  console.error(`\nnon riesco a partire: ${(error as Error).message}\n`);
+  console.error(`\n\x1b[31mnon riesco a partire: ${(error as Error).message}\x1b[0m\n`);
   await shutdown(1);
 }

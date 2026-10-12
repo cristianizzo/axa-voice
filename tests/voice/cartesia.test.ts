@@ -15,12 +15,12 @@ class FakeSocket extends EventTarget {
   send(data: string) {
     this.sent.push(data);
   }
-  close() {
+  close(code?: number, reason?: string) {
     if (this.closed) return;
     this.closed = true;
     this.readyState = 3;
     if (this.errorOnClose) this.dispatchEvent(new Event('error'));
-    this.dispatchEvent(new Event('close'));
+    this.dispatchEvent(Object.assign(new Event('close'), { code: code ?? 1000, reason: reason ?? '' }));
   }
   open() {
     this.readyState = 1;
@@ -155,9 +155,10 @@ test('the key is redacted even when the server echoes the connection URL back', 
   );
 });
 
-test('asks for raw 24 kHz PCM16, the rate the audio device runs at', async () => {
-  // Spec §3: the unit runs at 24 kHz on both scopes so TTS audio reaches the
-  // speaker with zero resampling.
+test('asks for raw PCM16 at config.audio.deviceRate, the rate the audio device runs at', async () => {
+  // Spec §3: the unit runs at the same rate on both scopes so TTS audio
+  // reaches the speaker with zero resampling. sample_rate must therefore
+  // track config.audio.deviceRate, not a hardcoded literal.
   const socket = new FakeSocket();
   const voice = new CartesiaVoice(config, { connect: () => socket as never });
 
@@ -174,11 +175,82 @@ test('asks for raw 24 kHz PCM16, the rate the audio device runs at', async () =>
   assert.deepEqual(first.output_format, {
     container: 'raw',
     encoding: 'pcm_s16le',
-    sample_rate: 24000,
+    sample_rate: config.audio.deviceRate,
   });
   assert.equal(first.model_id, config.voice.model);
   assert.equal(first.language, config.voice.language);
   assert.deepEqual(first.voice, { mode: 'id', id: config.voice.voiceId });
+
+  socket.message({ type: 'done' });
+  await pump;
+});
+
+test('an explicit language override wins over config.voice.language', async () => {
+  // Director tracks a live mid-conversation language switch and passes it in
+  // per call (spec: 2026-09-27) — CartesiaVoice itself stays stateless and
+  // must not need to be reconstructed to speak a different language.
+  const socket = new FakeSocket();
+  const voice = new CartesiaVoice(config, { connect: () => socket as never });
+
+  const pump = (async () => {
+    for await (const _ of voice.synthesize(sentences('Hello.'), new AbortController().signal, 'en')) {
+      // drain
+    }
+  })();
+  await tick(10);
+  socket.open();
+  await tick(10);
+
+  const first = JSON.parse(socket.sent[0]!);
+  assert.equal(first.language, 'en', 'the per-call override must win over config.voice.language');
+  assert.notEqual('en', config.voice.language, 'sanity: the override must actually differ from the config default');
+
+  socket.message({ type: 'done' });
+  await pump;
+});
+
+test('omitting the language override falls back to config.voice.language as before', async () => {
+  const socket = new FakeSocket();
+  const voice = new CartesiaVoice(config, { connect: () => socket as never });
+
+  const pump = (async () => {
+    for await (const _ of voice.synthesize(sentences('Ciao.'), new AbortController().signal)) {
+      // drain
+    }
+  })();
+  await tick(10);
+  socket.open();
+  await tick(10);
+
+  const first = JSON.parse(socket.sent[0]!);
+  assert.equal(first.language, config.voice.language);
+
+  socket.message({ type: 'done' });
+  await pump;
+});
+
+test('sample_rate follows config.audio.deviceRate, not a hardcoded literal', async () => {
+  // Proves the value is wired from config rather than baked in: a config with
+  // a different deviceRate must produce a different outgoing sample_rate.
+  const custom = loadConfig({ CARTESIA_API_KEY: 'sk_test' }) as unknown as {
+    audio: { deviceRate: number };
+  };
+  Object.assign(custom.audio, { deviceRate: 8000 });
+
+  const socket = new FakeSocket();
+  const voice = new CartesiaVoice(custom as never, { connect: () => socket as never });
+
+  const pump = (async () => {
+    for await (const _ of voice.synthesize(sentences('Uno.'), new AbortController().signal)) {
+      // drain
+    }
+  })();
+  await tick(10);
+  socket.open();
+  await tick(10);
+
+  const first = JSON.parse(socket.sent[0]!);
+  assert.equal(first.output_format.sample_rate, 8000);
 
   socket.message({ type: 'done' });
   await pump;
@@ -325,4 +397,116 @@ test('a connection that closes before done reports it instead of going quiet', a
   socket.close();
 
   await assert.rejects(pump, /closed/i);
+});
+
+test('a handshake that never opens, closes, nor errors fails after the connect timeout', async () => {
+  // Found against the live service: an account/credits/auth rejection that
+  // never completes a clean WS close used to hang the whole turn silently
+  // until the unrelated 45s turn-timeout in director.ts called abort().
+  const socket = new FakeSocket();
+  const voice = new CartesiaVoice(config, { connect: () => socket as never, connectTimeoutMs: 15 });
+
+  const pump = (async () => {
+    for await (const _ of voice.synthesize(sentences('Uno.'), new AbortController().signal)) {
+      // drain
+    }
+  })();
+
+  // The connect-timeout timer is deliberately unref'd (so it never by itself
+  // keeps a real CLI process alive). In production something else — mic
+  // capture, the event loop of the running app — always keeps Node alive
+  // regardless; here nothing else does, so this stands in for that.
+  const keepAlive = setInterval(() => {}, 1000);
+  try {
+    // Deliberately never call socket.open()/close()/error — the socket just
+    // sits there, exactly like the hung handshake found in production.
+    await assert.rejects(pump, /no response from the server/i);
+  } finally {
+    clearInterval(keepAlive);
+  }
+});
+
+test('a close with a code and reason before the socket ever opens surfaces both', async () => {
+  const socket = new FakeSocket();
+  const voice = new CartesiaVoice(config, { connect: () => socket as never });
+
+  const pump = (async () => {
+    for await (const _ of voice.synthesize(sentences('Uno.'), new AbortController().signal)) {
+      // drain
+    }
+  })();
+
+  await tick(10);
+  socket.close(4001, 'unauthorized');
+
+  await pump.then(
+    () => assert.fail('should have rejected'),
+    (err: Error) => {
+      assert.match(err.message, /code 4001/);
+      assert.match(err.message, /unauthorized/);
+      assert.match(err.message, /possibly out of credits or an invalid API key/i);
+    },
+  );
+});
+
+test('a connect timeout rejects promptly even when the next sentence never arrives', async () => {
+  // Found in review of the connect-timeout patch: `feeding` awaits
+  // `text.next()`, fed incrementally by the director as the model keeps
+  // generating. If that never resolves, `await feeding` after the main loop
+  // used to block forever even though the connect timeout had already fired
+  // and set `done = true` — the turn hung at a different line instead of
+  // being fixed. `stalledText` below never yields, simulating exactly that.
+  const socket = new FakeSocket();
+  const connectTimeoutMs = 15;
+  const voice = new CartesiaVoice(config, { connect: () => socket as never, connectTimeoutMs });
+
+  const stalledText = (async function* () {
+    // eslint-disable-next-line no-constant-condition
+    await new Promise<void>(() => {
+      /* never resolves: the director never produces the next sentence */
+    });
+    yield 'unreachable';
+  })();
+
+  const started = Date.now();
+  const pump = (async () => {
+    for await (const _ of voice.synthesize(stalledText, new AbortController().signal)) {
+      // drain
+    }
+  })();
+
+  // See the note in the previous test: the connect-timeout timer is unref'd
+  // by design, so this stands in for the "something else keeps Node alive"
+  // that is always true of the real CLI.
+  const keepAlive = setInterval(() => {}, 1000);
+  try {
+    // Deliberately never call socket.open()/close()/error, just like the
+    // existing connect-timeout test — the socket just sits there.
+    await assert.rejects(pump, /no response from the server/i);
+    const elapsed = Date.now() - started;
+    assert.ok(
+      elapsed < connectTimeoutMs + 500,
+      `expected synthesize() to reject within ~${connectTimeoutMs}ms of the connect timeout, took ${elapsed}ms`,
+    );
+  } finally {
+    clearInterval(keepAlive);
+  }
+});
+
+test('aborting while still connecting is a clean no-op, not a thrown error', async () => {
+  const socket = new FakeSocket();
+  const voice = new CartesiaVoice(config, { connect: () => socket as never });
+  const controller = new AbortController();
+
+  const pump = (async () => {
+    const out: Int16Array[] = [];
+    for await (const f of voice.synthesize(sentences('Uno.'), controller.signal)) out.push(f);
+    return out;
+  })();
+
+  await tick(10);
+  // Never opened: the socket is still mid-handshake when the barge-in lands.
+  controller.abort();
+
+  assert.deepEqual(await pump, [], 'a real user interrupt while connecting must not throw');
 });

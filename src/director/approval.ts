@@ -12,6 +12,16 @@ const YES = new Set([
   'certo', 'certamente', 'va bene', 'vabene', 'procedi', 'conferma', 'confermo',
   'avanti', 'perfetto', 'esatto', 'dai', 'approvato', 'autorizzo',
   'd accordo', 'sono d accordo',
+  // English equivalents (bug fix, 2026-09-27): after a language switch
+  // (director.ts's sticky #language), natural English replies like "yes" or
+  // "go ahead" matched nothing here, so interpretApproval() returned
+  // 'unclear' — denying the tool AND redispatching the bare reply as a
+  // nonsensical new question. Matched as whole normalised utterances of
+  // <=MAX_WORDS words, same as the Italian entries, so no per-language
+  // gating is needed: cross-language collisions are effectively impossible.
+  'yes', 'yes yes', 'yeah', 'yep', 'yup', 'ok yes', 'sure', 'sure thing',
+  'go ahead', 'go for it', 'do it', 'please do', 'confirm', 'confirmed',
+  'approved', 'sounds good', 'alright', 'all right', 'okay do it',
 ]);
 
 const NO = new Set([
@@ -20,6 +30,9 @@ const NO = new Set([
   'ferma', 'fermati', 'fermo', 'stop', 'annulla', 'annullalo', 'annullare',
   'lascia stare', 'lascia perdere', 'aspetta', 'aspetta un attimo',
   'non farlo', 'non voglio', 'non serve', 'niente', 'basta', 'nega',
+  // English equivalents (bug fix, 2026-09-27) — see YES's comment above.
+  'nope', 'nah', 'no thanks', 'don t', 'dont', 'do not', 'don t do it',
+  'dont do it', 'cancel', 'stop it', 'wait', 'hold on', 'not now', 'never mind',
 ]);
 
 /**
@@ -29,7 +42,7 @@ const NO = new Set([
 const MAX_WORDS = 4;
 
 /** Lowercase, strip accents and every non-alphanumeric character, collapse spaces. */
-function normalise(text: string): string {
+export function normalise(text: string): string {
   return text
     .toLowerCase()
     .normalize('NFD')
@@ -68,6 +81,10 @@ export function interpretApproval(text: string): ApprovalAnswer {
 const STOP = new Set([
   'basta', 'stop', 'lascia stare', 'lascia perdere',
   'annulla', 'annullalo', 'ferma', 'fermati', 'fermo',
+  // English equivalents (bug fix, 2026-09-27) — see YES's comment above:
+  // after a language switch, only the coincidentally-shared bare "stop"
+  // worked as a stop command.
+  'stop it', 'cancel', 'cancel that', 'that s enough', 'never mind', 'forget it',
 ]);
 
 /** Whole-utterance match, like interpretApproval: "non dirmi basta" is not a stop. */

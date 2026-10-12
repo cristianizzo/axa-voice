@@ -9,6 +9,8 @@
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline/promises';
 import { unlink, writeFile, readFile } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 
 // Le chiavi stanno in .env, che git ignora. Mai nel codice.
 try {
@@ -18,7 +20,14 @@ try {
 }
 
 const MODEL = new URL('./models/ggml-small.bin', import.meta.url).pathname;
-const AXA = '/Users/cristianizzo/Developers/axa-chat/cli-dev';
+// Repo privato a parte, non pubblico: niente default qui, va impostato esplicitamente.
+const AXA = process.env.AXA_CHAT_CLI_PATH?.trim();
+if (!AXA) {
+  throw new Error(
+    'AXA_CHAT_CLI_PATH is missing. Copy .env.example to .env and fill it in with the ' +
+      'path to the axa-chat CLI binary. Failing now rather than mid-conversation.',
+  );
+}
 const WAV = '/tmp/axa-voice-in.wav';
 
 const SYSTEM = `Stai parlando a voce, non scrivendo. Chi ti ascolta non vede lo schermo mentre parli.
@@ -148,7 +157,7 @@ function startClaude() {
     // nessuna conferma visiva che lo fermi. Serve prima una conferma parlata.
     '--allowedTools', 'WebSearch', 'WebFetch', 'Read', 'Glob', 'Grep', 'ToolSearch',
   ], {
-    env: { ...process.env, CLAUDE_CONFIG_DIR: '/Users/cristianizzo/.claude' },
+    env: { ...process.env, CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude') },
     stdio: ['pipe', 'pipe', 'ignore'],
   });
 

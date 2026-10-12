@@ -13,6 +13,18 @@ test('strips the hallucinations whisper emits for silence', () => {
   }
 });
 
+test('strips the large-v3-turbo sign-off hallucinations (2026-09-26)', () => {
+  for (const raw of [
+    'Grazie a tutti',
+    'grazie mille',
+    'Grazie di aver guardato',
+    "grazie per l'attenzione",
+    'Iscrivetevi al canale',
+  ]) {
+    assert.equal(clean(raw), '', `should have been dropped: ${JSON.stringify(raw)}`);
+  }
+});
+
 test('keeps short real words — they are the whole approval vocabulary', () => {
   // A minimum WORD count would drop every one of these (spec §8).
   assert.equal(clean('sì'), 'sì');

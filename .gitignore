@@ -1,6 +1,12 @@
 proto/models/
 models/
 node_modules/
-.env
+.env*
 native/aecio
 .claude/worktrees/
+.claude/
+CLAUDE.md
+.superpowers/
+debug-audio/
+.DS_Store
+docs/superpowers/

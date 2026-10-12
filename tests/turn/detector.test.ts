@@ -102,6 +102,31 @@ test('a quiet frame on its own does not start a turn', () => {
   assert.equal(started, 0, 'the onset threshold is higher than the continuation one');
 });
 
+test('residual echo above the ordinary onset threshold does not start a turn during self-play', () => {
+  // Between the ordinary onset (500) and the self-play one (1500): loud enough
+  // to be mistaken for speech by the normal bar, but the level AEC's own
+  // measured worst case (+0.7 dB on a steady tone) can plausibly leave behind
+  // from the Director's own voice.
+  const echo = () => Int16Array.from({ length: 320 }, () => 900);
+  let started = 0;
+  const d = new VadTurnDetector(config);
+  d.onSpeechStart(() => started++);
+  for (let i = 0; i < 10; i++) d.push(echo(), null, true);
+  assert.equal(started, 0, 'residual echo must not be read as a barge-in');
+
+  // The same level, with self-play not active, is an ordinary onset.
+  for (let i = 0; i < 10; i++) d.push(echo(), null, false);
+  assert.equal(started, 1, 'the same level is a real onset once the room is actually quiet');
+});
+
+test('a real barge-in still clears the raised self-play threshold', () => {
+  let started = 0;
+  const d = new VadTurnDetector(config);
+  d.onSpeechStart(() => started++);
+  for (let i = 0; i < 10; i++) d.push(loud(), null, true);
+  assert.equal(started, 1, 'a user actually speaking is well above residual echo, self-play or not');
+});
+
 test('silence alone does not end the turn while the transcript is still growing', () => {
   // Spec §5 ends a turn on VAD silence AND a stable transcript. Partials arrive on
   // a 350ms timer, so one can land after the user has already stopped and extend
