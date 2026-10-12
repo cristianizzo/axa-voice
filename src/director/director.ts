@@ -565,6 +565,30 @@ export class Director {
     if (muted) {
       this.#capturing = false;
       this.#capturingFrom = null;
+      // `#capturing = false` above only stops NEW frames from reaching the
+      // current TranscriptionStream; it does not close the stream itself.
+      // Whatever audio was already buffered mid-utterance (muting cancels a
+      // capture rather than letting it finish, per this method's own doc
+      // comment) stays sitting in that stream's buffer, unflushed. Worse,
+      // with the real VadTurnDetector its own `#speaking` is left set too —
+      // `#onFrame` returns before ever calling `turns.push()` while muted
+      // (see its own comment), so the detector never sees the silence that
+      // would otherwise end its turn normally. The very first frame it DOES
+      // see after unmuting is then measured against a stale
+      // `#lastSpeechAt`/`#prefixStableSince` from before the mute, so a
+      // silent frame can immediately satisfy the silence+stability test and
+      // fire a turnEnd for nothing — which `#onTurnEnd` correctly no-ops on
+      // (nothing was ever captured post-unmute), but does NOT clean up the
+      // stream, since it only calls `#takeFinal()` (close + reopen) on paths
+      // that had something to take. Left alone, the NEXT real utterance's
+      // `#onSpeechStart` pushes its audio onto that same stale, still-open
+      // stream — the old buffered samples and the new utterance get
+      // transcribed together as one. Closing and reopening here, discarding
+      // whatever the stale stream's own final transcription comes back as
+      // (it belongs to speech the user explicitly cut off by muting, not a
+      // real answer), is what `#onTurnEnd`/`#takeFinal` already do on every
+      // other path that ends a capture — this is muting's own equivalent.
+      void this.#discardStream();
       if (this.#state === 'HEARING') this.#setState('LISTENING');
       // HEARING can be a barge-in pause waiting on `#onTurnEnd`'s
       // stop-vs-follow-up decision (see `#pausedForBargeIn`'s own comment).
@@ -1042,7 +1066,23 @@ export class Director {
         }
         return;
       }
-      if (said) this.#queued.push(said); // Drained at the end of #run.
+      if (said) {
+        // Checked here too, not only on the ordinary LISTENING path further
+        // below: an utterance that starts while the Director is THINKING (or
+        // paused mid-SPEAKING on a barge-in) never reaches that path at all —
+        // it is routed here, queued, and later drained straight into #ask()
+        // (see `#queued`'s own comment, and #run's "Drained at the end of
+        // #run" drain). Without this check a spoken GUI command ("attiva la
+        // gui") said while a tool is running would reach Claude instead of
+        // being handled locally, in exactly the background-work case the
+        // check exists to bypass (gui-command.ts).
+        const gui = interpretGuiCommand(said);
+        if (gui) {
+          void this.#deps.runGui(gui).then((line) => this.#say(line));
+        } else {
+          this.#queued.push(said); // Drained at the end of #run.
+        }
+      }
       if (wasPausedForBargeIn) {
         // Not a stop command — nothing was actually cancelled, so there is
         // nothing to tell Claude it missed. Resume the very same turn:
@@ -1136,6 +1176,22 @@ export class Director {
       return;
     }
     this.#ask(text);
+  }
+
+  /**
+   * `setMuted(true)`'s own equivalent of `#takeFinal`: closes whatever
+   * capture stream is currently open — flushing (and discarding) any
+   * buffered samples — and opens a fresh one in its place, so the next
+   * utterance after unmuting starts from an empty buffer instead of being
+   * appended onto stale pre-mute audio (see `setMuted`'s own comment for the
+   * full mechanism). Unlike `#takeFinal`, the resulting transcript is never
+   * read: it belongs to speech the user explicitly cut off by muting.
+   */
+  async #discardStream(): Promise<void> {
+    const stream = this.#stream;
+    this.#stream = undefined;
+    await stream?.close(this.#language);
+    await this.#openStream();
   }
 
   /** Close the stream to force the final transcription, then open the next one. */

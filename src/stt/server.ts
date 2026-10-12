@@ -34,7 +34,7 @@ export async function preflight(config: Config): Promise<void> {
 
   await access(modelPath).catch(() => {
     throw new Error(
-      `whisper model not found at ${modelPath}. Download ggml-small.bin from ` +
+      `whisper model not found at ${modelPath}. Download it from ` +
         'https://huggingface.co/ggerganov/whisper.cpp',
     );
   });

@@ -15,6 +15,21 @@ test('preflight names the missing model file', async () => {
   );
 });
 
+test('the missing-model error never hardcodes a stale default filename', async () => {
+  // The actual default model (config.ts) is ggml-large-v3-turbo.bin, not
+  // ggml-small.bin — the error must point at whatever `modelPath` really is
+  // instead of telling users to download a file the defaults no longer use.
+  await assert.rejects(
+    preflight(withStt({ modelPath: '/nope/ggml-large-v3-turbo.bin' })),
+    (err: unknown) => {
+      assert.ok(err instanceof Error);
+      assert.match(err.message, /ggml-large-v3-turbo\.bin/);
+      assert.doesNotMatch(err.message, /ggml-small\.bin/);
+      return true;
+    },
+  );
+});
+
 test('preflight refuses to start without the VAD model', async () => {
   await assert.rejects(
     preflight(withStt({ vadModelPath: '/nope/ggml-silero-v5.1.2.bin' })),

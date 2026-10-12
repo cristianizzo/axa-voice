@@ -62,6 +62,17 @@ const CLOSE_TIMEOUT_MS = 2000;
 const STALE_RESULT_WINDOW_MS = 10_000;
 
 /**
+ * How long #clearConversation waits for the CLI to confirm a "/clear" with
+ * its conversation_reset message, before giving up. "/clear" is a LOCAL
+ * command (sdk.d.ts's TerminalReason doc comment: "Unset when the loop was
+ * bypassed (local slash command)") — it never reaches the model, so a slow
+ * reply here would mean something is already badly wrong with the
+ * subprocess, not ordinary turn latency. Short on purpose, and best-effort:
+ * see #clearConversation.
+ */
+const CLEAR_CONFIRM_MS = 2000;
+
+/**
  * The warm-up turn's throwaway message (see #warmUp). Used to be a bare '.',
  * which is ambiguous — combined with the system prompt's "search seriously,
  * don't give up after one empty attempt" instruction, it could invite the
@@ -271,6 +282,8 @@ export class ClaudeAgentSession implements AgentSession {
    * spliced out and cleared can never do that a second time.
    */
   #staleResultTimers: NodeJS.Timeout[] = [];
+  /** Resolves the in-flight #clearConversation() call, if one is pending. */
+  #pendingClearResolve: (() => void) | undefined;
   /**
    * True while a give-up (warm-up or interrupt()) has put the session into
    * 'plan' mode and no tool call should execute: gates both the
@@ -476,6 +489,20 @@ export class ClaudeAgentSession implements AgentSession {
    * into the same give-up path as a timed-out drain, on purpose: whichever
    * one didn't return in time, the CLI may still be mid-flight, and the
    * response is identical either way.
+   *
+   * Every exit path below ends with #clearConversation(), on purpose: the
+   * CLI's `query()` handle can only be sent a prompt once (sdk.d.ts's
+   * WarmQuery.query() doc comment — "Can only be called once per
+   * WarmQuery"), so there is no way to warm the subprocess in one
+   * conversation and then hand the caller a second, genuinely separate one
+   * — the warm-up message and the user's real first turn are necessarily
+   * the same long-lived SDK conversation. Left alone, that means every
+   * later turn carries the warm-up's own throwaway exchange ("Rispondi
+   * soltanto con 'ok'…" / Claude's reply) as real prior context, forever —
+   * paid for in tokens on every turn, and able to bias the first genuine
+   * answer. #clearConversation() erases it immediately afterward via the
+   * CLI's own "/clear" local command, which resets the conversation without
+   * spawning a new subprocess or paying for a second round trip.
    */
   async #warmUp(): Promise<void> {
     this.#debug('agent: warm-up starting');
@@ -492,6 +519,7 @@ export class ClaudeAgentSession implements AgentSession {
       // settled already; #endTurn cleared it
       this.#debug('agent: warm-up settled normally');
       await this.#exitPlanMode();
+      await this.#clearConversation();
       return;
     }
 
@@ -508,6 +536,7 @@ export class ClaudeAgentSession implements AgentSession {
     if (turn.ended) {
       this.#debug('agent: warm-up interrupt succeeded');
       await this.#exitPlanMode();
+      await this.#clearConversation();
       return;
     }
 
@@ -518,6 +547,7 @@ export class ClaudeAgentSession implements AgentSession {
     if (this.#turn !== turn) {
       this.#debug('agent: warm-up drained after interrupt');
       await this.#exitPlanMode();
+      await this.#clearConversation();
       return;
     }
 
@@ -533,6 +563,38 @@ export class ClaudeAgentSession implements AgentSession {
     this.#debug('agent: warm-up gave up, neither interrupt() nor its result returned in time');
     this.#armStaleResult();
     this.#endTurn();
+    // Queued behind whatever the abandoned turn still owes: the CLI's single
+    // ordered stream (see STALE_RESULT_WINDOW_MS) means this cannot jump
+    // ahead of it, so the quarantine above still does its job regardless of
+    // when the clear itself gets confirmed.
+    await this.#clearConversation();
+  }
+
+  /**
+   * Erases the warm-up's own throwaway exchange from the conversation every
+   * real turn shares, via the CLI's built-in "/clear" local command (see
+   * #warmUp's doc comment for why this, rather than a second SDK session, is
+   * the fix). "/clear" never reaches the model — sdk.d.ts documents it as a
+   * LOCAL command the CLI's own loop handles without a turn — and the CLI
+   * confirms it with a dedicated `conversation_reset` message instead of the
+   * ordinary result/turn machinery #turn tracks, so this is deliberately NOT
+   * wired through createTurn()/#emit(): no model turn ever runs for it, and
+   * nothing here should be mistaken for one by the stale-result quarantine.
+   * Best-effort and bounded (CLEAR_CONFIRM_MS): if the CLI never confirms,
+   * there is nothing more useful to do than stop waiting — the "/clear" sent
+   * either still lands later or the subprocess is already in worse trouble
+   * than this method could fix.
+   */
+  async #clearConversation(): Promise<void> {
+    this.#debug('agent: clearing warm-up exchange from conversation context');
+    await withDeadline(
+      new Promise<void>((resolve) => {
+        this.#pendingClearResolve = resolve;
+        this.#input.push('/clear');
+      }),
+      CLEAR_CONFIRM_MS,
+    );
+    this.#pendingClearResolve = undefined;
   }
 
   /**
@@ -599,6 +661,16 @@ export class ClaudeAgentSession implements AgentSession {
    * down from `#pump` is gone rather than renamed-but-unused.
    */
   #dispatch(message: SDKMessage): void {
+    if (message.type === 'conversation_reset') {
+      // The CLI's confirmation that a pushed "/clear" took effect (see
+      // #clearConversation). Never routed through #turn/#emit: no model turn
+      // ran for it, so there is no turn here to end or events to append to.
+      this.#debug('agent: conversation reset (warm-up exchange cleared)');
+      this.#pendingClearResolve?.();
+      this.#pendingClearResolve = undefined;
+      return;
+    }
+
     if (message.type === 'stream_event') {
       // Deltas exist for the main session only; anything with a parent is a
       // subagent sidechain and must not be spoken as the answer (spec §12).
@@ -817,9 +889,27 @@ export class ClaudeAgentSession implements AgentSession {
     // concurrently with #enterPlanMode, not sequenced after it: the microphone
     // is already open, and doubling the barge-in latency to buy a mode switch
     // that is itself only defense-in-depth would be the wrong trade.
+    //
+    // The raw `query.interrupt()` call is bounded by the same
+    // `interruptTimeoutMs` #enterPlanMode already uses internally, NOT left
+    // to run unbounded inside this Promise.all: the Director's own
+    // `#interrupt()` wrapper (director.ts) races a timer against this whole
+    // method, but that wrapper giving up does nothing to the call still
+    // pending in here — a hung SDK interrupt() would keep this `await`
+    // suspended well past the Director's own deadline, with #turn still
+    // pointing at the turn this method was supposed to be retiring. The
+    // Director would move on believing the stale-result quarantine is
+    // armed (see #armStaleResult below) when in fact this method never got
+    // that far, so the abandoned turn's belated events/result would reach
+    // whatever new turn `send()` had since started — the exact leak
+    // #armStaleResult/#takeStaleResult exist to prevent. Without its own
+    // bound here, nothing upstream can close that gap.
     await Promise.all([
       this.#enterPlanMode(),
-      Promise.resolve(this.#query?.interrupt()).catch(() => undefined),
+      withDeadline(
+        Promise.resolve(this.#query?.interrupt()).catch(() => undefined),
+        this.#config.director.interruptTimeoutMs,
+      ),
     ]);
     if (!turn || turn.ended) {
       await this.#exitPlanMode();

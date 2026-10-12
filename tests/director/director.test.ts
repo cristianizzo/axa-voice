@@ -555,6 +555,57 @@ test('a gui toggle command never reaches Claude', async () => {
   await d.stop();
 });
 
+test('a gui toggle command said while thinking never reaches Claude either', async () => {
+  // Mirrors "a gui toggle command never reaches Claude" above, but for an
+  // utterance that begins while the Director is THINKING (capturingFrom ===
+  // 'THINKING'). That path is handled entirely by the `beganWhileWorking`
+  // branch of #onTurnEnd, which queues the recaptured text and drains it
+  // straight into #ask() — bypassing the ordinary LISTENING path's
+  // interpretGuiCommand() check, so a spoken GUI command said over a running
+  // tool used to reach Claude instead of being handled locally.
+  const f = makeFakes(config, {
+    runGui: async (mode) => `called with ${mode}`,
+  });
+  const d = new Director(f.deps);
+  await d.start();
+
+  f.turns.speechStart();
+  f.transcriber.final('cerca qualcosa');
+  f.turns.turnEnd();
+  await f.tick();
+  assert.equal(d.state, 'THINKING');
+
+  // Said while the first turn is still being worked on (no text/done emitted
+  // yet) — a follow-up onset, not a fresh one.
+  f.turns.speechStart();
+  f.transcriber.final('attiva la gui');
+  f.turns.turnEnd();
+  await f.tick();
+
+  assert.deepEqual(
+    f.agent.sent,
+    ['cerca qualcosa'],
+    'the gui command must never be queued into Claude, not even as a follow-up',
+  );
+  assert.deepEqual(
+    f.voice.spoken,
+    ['called with on'],
+    'the confirmation is said directly, the same as the ordinary LISTENING path',
+  );
+
+  // The original turn is untouched and finishes normally.
+  f.agent.emitText('Risultati trovati.');
+  f.agent.emitDone();
+  await f.tick();
+  assert.deepEqual(
+    f.agent.sent,
+    ['cerca qualcosa'],
+    'nothing else was ever queued behind the original turn',
+  );
+
+  await d.stop();
+});
+
 test('a hallucinated transcript is never queued', async () => {
   const f = makeFakes(config);
   const d = new Director(f.deps);
@@ -1735,6 +1786,58 @@ test('muting mid-utterance cancels it instead of waiting it out', async () => {
     f.transcriber.current!.pushed.length,
     1,
     'no further frames are captured once muted',
+  );
+
+  await d.stop();
+});
+
+test('muting mid-utterance discards the stale stream instead of leaving it open for the next one', async () => {
+  // Without this, muting mid-capture stops new frames reaching the
+  // TranscriptionStream but leaves the stream itself open with whatever it
+  // had already buffered. VadTurnDetector's own `#speaking` is left stale
+  // too (frames never reach it while muted), so the first frame after
+  // unmuting can fire a spurious turnEnd that `#onTurnEnd` correctly no-ops
+  // on — but without ever closing/reopening the stream, since it only does
+  // that on a path that actually captured something. The NEXT real
+  // utterance then has its audio appended onto the stale buffered samples
+  // in that same, never-reopened stream — transcribed as one utterance
+  // instead of two.
+  const f = makeFakes(config);
+  const d = new Director(f.deps);
+  await d.start();
+
+  f.turns.speechStart();
+  f.audioIn.frame();
+  const staleStream = f.transcriber.current!;
+  assert.equal(staleStream.pushed.length, 1, 'sanity: the pre-mute utterance was captured');
+
+  d.setMuted(true);
+  await f.tick();
+
+  assert.equal(
+    staleStream.closed,
+    true,
+    'the stale stream must be closed when muting cancels its utterance',
+  );
+  assert.notEqual(
+    f.transcriber.current,
+    staleStream,
+    'a fresh stream must replace the stale one so capture does not resume into it',
+  );
+
+  d.setMuted(false);
+  f.turns.speechStart();
+  f.audioIn.frame();
+
+  assert.equal(
+    f.transcriber.current!.pushed.length,
+    1,
+    'the next utterance must land in the fresh stream, not pile onto the stale one',
+  );
+  assert.equal(
+    staleStream.pushed.length,
+    1,
+    'the stale stream must never receive audio from a later utterance',
   );
 
   await d.stop();

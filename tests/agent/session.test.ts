@@ -19,8 +19,12 @@ interface FakeSdk {
   emit(message: unknown): void;
   /** Make the pump's next read reject, as a transport error would. */
   fail(error: Error): void;
-  /** Text the session actually handed to Claude, in order. */
+  /** Text the session actually handed to Claude, in order. Never includes "/clear" (see `clears`). */
   prompts: string[];
+  /** How many "/clear" local commands the session has pushed (see #clearConversation). */
+  clears: number;
+  /** Answers each "/clear" with a conversation_reset message immediately, unless disabled. */
+  autoAnswerClear: boolean;
   /** Options the session passed to startup(). */
   options: Record<string, unknown> | undefined;
   interrupts: number;
@@ -71,10 +75,12 @@ function makeFakeSdk(): FakeSdk {
     returns: 0,
     resultOnInterrupt: true,
     autoAnswerWarmUp: true,
+    autoAnswerClear: true,
     hangInterrupt: false,
     rejectInterrupt: false,
     permissionModes: [] as string[],
     strictTurnOrdering: false,
+    clears: 0,
   };
 
   const wake = (): void => {
@@ -177,7 +183,24 @@ function makeFakeSdk(): FakeSdk {
             if (state.strictTurnOrdering) await waitUntilResultReported();
             const next = await iterator.next();
             if (next.done) return;
-            state.prompts.push(next.value.message.content);
+            const content = next.value.message.content;
+            // "/clear" is the CLI's own local command (#clearConversation):
+            // it never reaches the model, is confirmed with a dedicated
+            // conversation_reset message instead of a turn result, and must
+            // never show up in `prompts` (which models real model turns).
+            if (content === '/clear') {
+              state.clears += 1;
+              if (state.autoAnswerClear) {
+                emit({
+                  type: 'conversation_reset',
+                  new_conversation_id: 'fake-conversation',
+                  uuid: 'fake-uuid',
+                  session_id: 'fake-session',
+                });
+              }
+              continue;
+            }
+            state.prompts.push(content);
             if (state.strictTurnOrdering) resultPending = true;
             // start()'s warm-up is always the first message pushed to a fresh
             // session; answer it immediately so tests do not have to know it
@@ -227,6 +250,15 @@ function makeFakeSdk(): FakeSdk {
     },
     set autoAnswerWarmUp(value: boolean) {
       state.autoAnswerWarmUp = value;
+    },
+    get autoAnswerClear() {
+      return state.autoAnswerClear;
+    },
+    set autoAnswerClear(value: boolean) {
+      state.autoAnswerClear = value;
+    },
+    get clears() {
+      return state.clears;
     },
     get hangInterrupt() {
       return state.hangInterrupt;
@@ -293,16 +325,18 @@ async function startSession(
     interruptDrainMs: number;
     turnTimeoutMs: number;
     staleResultWindowMs: number;
+    interruptTimeoutMs: number;
   }> = {},
 ): Promise<ClaudeAgentSession> {
   const cfg =
-    overrides.approvalTimeoutMs ?? overrides.turnTimeoutMs
+    overrides.approvalTimeoutMs ?? overrides.turnTimeoutMs ?? overrides.interruptTimeoutMs
       ? ({
           ...config,
           director: {
             ...config.director,
             approvalTimeoutMs: overrides.approvalTimeoutMs ?? config.director.approvalTimeoutMs,
             turnTimeoutMs: overrides.turnTimeoutMs ?? config.director.turnTimeoutMs,
+            interruptTimeoutMs: overrides.interruptTimeoutMs ?? config.director.interruptTimeoutMs,
           },
         } as never)
       : config;
@@ -528,6 +562,53 @@ test('start() sends exactly one throwaway message before resolving', async () =>
   await settle();
 
   assert.deepEqual(sdk.prompts, [WARM_UP_MESSAGE], 'start() must push exactly one throwaway message');
+  await session.close();
+});
+
+test('start() erases the warm-up exchange from the shared conversation via "/clear"', async () => {
+  // The WarmQuery handle can only be sent a prompt once (sdk.d.ts:
+  // "Can only be called once per WarmQuery"), so the warm-up message and the
+  // caller's real first turn are necessarily the same long-lived SDK
+  // conversation. Without an explicit "/clear", the warm-up's own throwaway
+  // exchange would sit in context forever, on every later turn.
+  const sdk = makeFakeSdk();
+  const session = new ClaudeAgentSession(config, { startupFn: sdk.startupFn });
+  await session.start();
+  await settle();
+
+  assert.equal(sdk.clears, 1, 'start() must clear the warm-up exchange from context exactly once');
+  await session.close();
+});
+
+test('a warm-up that settles normally is cleared only after plan mode has been exited', async () => {
+  const sdk = makeFakeSdk();
+  const session = new ClaudeAgentSession(config, { startupFn: sdk.startupFn });
+  await session.start();
+  await settle();
+
+  assert.deepEqual(
+    sdk.permissionModes,
+    ['plan', 'default'],
+    'plan mode must already be exited before the context clear runs',
+  );
+  assert.equal(sdk.clears, 1);
+  await session.close();
+});
+
+test('a warm-up give-up still clears the throwaway exchange from context', async () => {
+  // Mirrors "a warm-up give-up interrupts the CLI" below: even when the
+  // warm-up times out and the turn is abandoned, its own user message and
+  // whatever Claude said before being cut must not be left in the shared
+  // conversation either.
+  const sdk = makeFakeSdk();
+  sdk.autoAnswerWarmUp = false; // the warm-up's throwaway message is never answered
+  const fast = { ...config, director: { ...config.director, turnTimeoutMs: 20 } };
+  const session = new ClaudeAgentSession(fast, { startupFn: sdk.startupFn, interruptDrainMs: 50 });
+  const started = session.start();
+  await new Promise((resolve) => setTimeout(resolve, 60)); // past turnTimeoutMs
+  await started;
+
+  assert.equal(sdk.clears, 1, 'a gave-up warm-up must still be cleared from context');
   await session.close();
 });
 
@@ -1289,6 +1370,48 @@ test('interrupt() gives up draining rather than blocking barge-in forever', asyn
   const started = Date.now();
   await session.interrupt();
   assert.ok(Date.now() - started < 500, 'the microphone is already open; nothing may block here');
+  await session.close();
+});
+
+test('a hung query.interrupt() does not block the public interrupt() forever', async () => {
+  // Mirrors "a warm-up whose interrupt() itself never returns..." above, but
+  // for the public interrupt() method the Director actually calls. The
+  // Director's own #interrupt() wrapper (director.ts) races a timer against
+  // THIS whole method and gives up after interruptTimeoutMs — but giving up
+  // there does nothing for a raw query.interrupt() call still hung inside
+  // this method's own Promise.all. Left unbounded, this method would still
+  // be awaiting it long after the Director moved on, with #turn still
+  // pointing at the turn this call was supposed to retire — so the
+  // abandoned turn's belated result/events would never be quarantined and
+  // would leak into whatever new turn the Director started next.
+  const sdk = makeFakeSdk();
+  sdk.hangInterrupt = true; // query.interrupt() itself never resolves
+  const session = await startSession(sdk, { interruptDrainMs: 50, interruptTimeoutMs: 80 });
+  const events = drain(session.send('raccontami una storia'));
+  await settle();
+  sdk.emit(textDelta("C'era una volta"));
+  await settle();
+
+  const started = Date.now();
+  await session.interrupt();
+  assert.ok(Date.now() - started < 1000, 'a hung query.interrupt() must not block interrupt() forever');
+  sdk.releaseInterrupts(); // it does eventually come back, just not within budget
+
+  // The abandoned turn's belated result must still be quarantined, exactly
+  // as it is when interrupt() itself returns promptly.
+  sdk.emit({ type: 'result', subtype: 'error_during_execution' });
+  await settle();
+  await events;
+
+  const next = drain(session.send('aspetta'));
+  await settle();
+  sdk.emit(textDelta('Dimmi.'));
+  sdk.emit(RESULT);
+  assert.deepEqual(
+    (await next).filter((e) => e.type === 'text').map((e) => e.delta),
+    ['Dimmi.'],
+    "the abandoned turn's belated result must never leak into the next turn",
+  );
   await session.close();
 });
 
