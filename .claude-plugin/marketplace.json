@@ -1,0 +1,14 @@
+{
+  "name": "axa-voice-marketplace",
+  "owner": {
+    "name": "cristianizzo"
+  },
+  "description": "Single-plugin marketplace that lists this checkout's own axa-voice plugin.",
+  "plugins": [
+    {
+      "name": "axa-voice",
+      "source": ".",
+      "description": "Launch the axa-voice voice assistant (mic in, speaker out) as a background process from within Claude Code."
+    }
+  ]
+}
